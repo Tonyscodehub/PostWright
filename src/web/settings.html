@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postwright – Settings</title>
+<style>
+  :root { --ink:#1d2330; --muted:#5b6475; --line:#d9dee7; --bg:#f5f6f8; --card:#fff; --accent:#1f5f8b; --ok:#2e7d32; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --ink:#e6e9ef; --muted:#9aa3b2; --line:#30363f; --bg:#14171c; --card:#1c2027; --accent:#6aa9d8; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); background:var(--card); display:flex; justify-content:space-between; align-items:baseline; }
+  header h1 { margin:0; font-size:20px; }
+  header span { color:var(--muted); }
+  main { max-width:820px; margin:24px auto; padding:0 16px; display:grid; gap:20px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px 22px; }
+  h2 { margin:0 0 4px; font-size:17px; }
+  p.hint { margin:0 0 14px; color:var(--muted); font-size:14px; }
+  label { display:block; font-weight:600; margin:12px 0 4px; font-size:14px; }
+  input[type=text], input[type=email], input[type=password], input[type=datetime-local], textarea, select {
+    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px; font:inherit; color:inherit; background:transparent; }
+  textarea { min-height:110px; resize:vertical; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .check { display:flex; gap:8px; align-items:center; font-weight:400; margin-top:12px; }
+  button { margin-top:14px; padding:8px 16px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--line); margin-top:0; padding:4px 10px; }
+  .status { margin-left:10px; font-size:14px; }
+  .status.ok { color:var(--ok); } .status.err { color:var(--err); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td, th { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+  code { font-size:13px; background:var(--bg); padding:2px 5px; border-radius:4px; }
+  .inline { display:flex; gap:8px; align-items:center; margin-top:6px; }
+  .inline input[type=email] { flex:1; }
+</style>
+</head>
+<body>
+<header><h1>Postwright</h1><span id="who"></span></header>
+<main>
+  <section>
+    <h2>Out of office</h2>
+    <p class="hint">Sends one automatic reply per sender every four days. Mailing lists, newsletters and automated mail are never answered.</p>
+    <label class="check"><input type="checkbox" id="v-enabled"> Send automatic replies</label>
+    <div class="row">
+      <div><label for="v-start">From (optional)</label><input type="datetime-local" id="v-start"></div>
+      <div><label for="v-end">Until (optional)</label><input type="datetime-local" id="v-end"></div>
+    </div>
+    <label for="v-subject">Subject</label>
+    <input type="text" id="v-subject" placeholder="Automatic reply: (original subject)">
+    <label for="v-body">Message</label>
+    <textarea id="v-body" placeholder="I am out of the office until Monday and will reply when I return."></textarea>
+    <label class="check"><input type="checkbox" id="v-internal"> Only reply to people in my organisation's domains</label>
+    <button id="save-vacation">Save</button><span class="status" id="vacation-status"></span>
+  </section>
+
+  <section>
+    <h2>Signature</h2>
+    <p class="hint">Stored on the server so every device and app can use the same signature.</p>
+    <label for="s-text">Plain-text signature</label>
+    <textarea id="s-text"></textarea>
+    <label for="s-html">HTML signature (optional)</label>
+    <textarea id="s-html" placeholder="&lt;b&gt;Tony Johncock&lt;/b&gt;&lt;br&gt;Postwright"></textarea>
+    <label class="check"><input type="checkbox" id="s-append"> Add my signature to sent mail automatically if my app hasn't</label>
+    <button id="save-signature">Save</button><span class="status" id="signature-status"></span>
+  </section>
+
+  <section>
+    <h2>Calendars</h2>
+    <p class="hint">Add this server to Thunderbird, Apple Calendar or DAVx5 using <code id="caldav-url"></code> with your email address and password.</p>
+    <table><thead><tr><th>Calendar</th><th>Owner</th><th>Shared with</th><th></th></tr></thead><tbody id="cal-rows"></tbody></table>
+    <div class="inline"><input type="text" id="new-cal" placeholder="New calendar name"><button class="secondary" id="add-cal">Create</button></div>
+    <span class="status" id="cal-status"></span>
+  </section>
+
+  <section>
+    <h2>Password</h2>
+    <div class="row">
+      <div><label for="p-current">Current password</label><input type="password" id="p-current" autocomplete="current-password"></div>
+      <div><label for="p-new">New password (10+ characters)</label><input type="password" id="p-new" autocomplete="new-password"></div>
+    </div>
+    <button id="save-password">Change password</button><span class="status" id="password-status"></span>
+  </section>
+</main>
+<script src="/settings.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+/target
+/data
+postwright.toml
+*.db
+*.db-wal
+*.db-shm
