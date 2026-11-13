@@ -75,14 +75,11 @@ certbot certonly --standalone -d mail.example.com --deploy-hook "systemctl reloa
 
 Then set `tls.cert = "/etc/letsencrypt/live/mail.example.com/fullchain.pem"` and the matching `privkey.pem` in `postwright.toml`. Postwright reloads the certificate on `SIGHUP` (Unix) and every 12 hours on every platform, so renewals need no restart.
 
-## Running it at home: read this first
+## Outbound reputation
 
-Home connections are hard for outbound mail. Inbound works fine once ports 25, 465, 587, 993, and 443 are forwarded from OPNsense. Outbound is the problem:
+If the server has a static IP with matching reverse DNS (PTR), it sends direct to recipients' MX hosts. With DKIM, SPF, and DMARC in place, mail is accepted by Gmail, Outlook, and the rest.
 
-- Most residential IP ranges are on Spamhaus's PBL. Gmail, Outlook, and others will reject or junk mail sent directly from them, even with perfect SPF, DKIM, and DMARC.
-- Many ISPs block outbound port 25, and you usually can't set reverse DNS on a residential line.
-
-The usual fix is a **smarthost**: send outbound mail through a relay with a clean reputation (an SMTP relay service, or a small VPS). Postwright supports this directly:
+On a connection without that (dynamic or residential ranges, or blocked outbound port 25), route outbound mail through a smarthost. Postwright still DKIM-signs everything itself, so DMARC alignment stays intact:
 
 ```toml
 [queue]
@@ -90,8 +87,6 @@ relay_host = "smtp.relay-provider.com:587"
 relay_username = "..."
 relay_password = "..."
 ```
-
-Postwright still DKIM-signs everything itself, so DMARC alignment stays intact. The alternative is to run Postwright on a VPS with a clean IP and proper PTR.
 
 ## Out of office
 
