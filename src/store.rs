@@ -143,6 +143,7 @@ pub struct User {
     pub password: String,
     pub quota_bytes: i64,
     pub enabled: bool,
+    pub is_admin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +196,9 @@ fn migrate(c: &Connection) -> Result<()> {
         let cols = st.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
         Ok(cols.iter().any(|c| c == col))
     };
+    if !has("users", "is_admin")? {
+        c.execute_batch("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")?;
+    }
     if !has("domains", "alias_of")? {
         c.execute_batch("ALTER TABLE domains ADD COLUMN alias_of TEXT")?;
     }
@@ -335,12 +339,13 @@ fn row_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
         password: r.get(2)?,
         quota_bytes: r.get(3)?,
         enabled: r.get::<_, i64>(4)? != 0,
+        is_admin: r.get::<_, i64>(5)? != 0,
     })
 }
 
 pub fn find_user(c: &Connection, email: &str) -> Result<Option<User>> {
     Ok(c.query_row(
-        "SELECT id, email, password, quota_bytes, enabled FROM users WHERE email = ?1",
+        "SELECT id, email, password, quota_bytes, enabled, is_admin FROM users WHERE email = ?1",
         [email.to_ascii_lowercase()],
         row_user,
     )
@@ -349,7 +354,7 @@ pub fn find_user(c: &Connection, email: &str) -> Result<Option<User>> {
 
 pub fn user_by_id(c: &Connection, id: i64) -> Result<Option<User>> {
     Ok(c.query_row(
-        "SELECT id, email, password, quota_bytes, enabled FROM users WHERE id = ?1",
+        "SELECT id, email, password, quota_bytes, enabled, is_admin FROM users WHERE id = ?1",
         [id],
         row_user,
     )
@@ -357,7 +362,7 @@ pub fn user_by_id(c: &Connection, id: i64) -> Result<Option<User>> {
 }
 
 pub fn list_users(c: &Connection) -> Result<Vec<User>> {
-    let mut st = c.prepare("SELECT id, email, password, quota_bytes, enabled FROM users ORDER BY email")?;
+    let mut st = c.prepare("SELECT id, email, password, quota_bytes, enabled, is_admin FROM users ORDER BY email")?;
     let v = st.query_map([], row_user)?.collect::<Result<Vec<_>, _>>()?;
     Ok(v)
 }
@@ -390,6 +395,18 @@ pub fn create_user(c: &mut Connection, email: &str, pw_hash: &str, quota: i64) -
 
 pub fn set_password(c: &Connection, email: &str, pw_hash: &str) -> Result<bool> {
     Ok(c.execute("UPDATE users SET password = ?2 WHERE email = ?1", params![email.to_ascii_lowercase(), pw_hash])? > 0)
+}
+
+pub fn set_admin(c: &Connection, email: &str, admin: bool) -> Result<bool> {
+    Ok(c.execute("UPDATE users SET is_admin = ?2 WHERE email = ?1", params![email.to_ascii_lowercase(), admin as i64])? > 0)
+}
+
+pub fn set_quota(c: &Connection, email: &str, bytes: i64) -> Result<bool> {
+    Ok(c.execute("UPDATE users SET quota_bytes = ?2 WHERE email = ?1", params![email.to_ascii_lowercase(), bytes])? > 0)
+}
+
+pub fn delete_queue_item(c: &mut Connection, id: i64) -> Result<()> {
+    queue_done(c, id)
 }
 
 pub fn set_enabled(c: &Connection, email: &str, enabled: bool) -> Result<bool> {

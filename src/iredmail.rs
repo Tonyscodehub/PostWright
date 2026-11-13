@@ -17,6 +17,19 @@
 //! using the credentials iRedMail already configured, so nothing needs to be opened up.
 
 use crate::caldav;
+
+/// Output of the most recent import, for the admin console.
+pub static OUTPUT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+macro_rules! say {
+    ($($t:tt)*) => {{
+        let line = format!($($t)*);
+        println!("{line}");
+        if let Ok(mut o) = OUTPUT.lock() {
+            o.extend(line.lines().map(String::from));
+        }
+    }};
+}
 use crate::store::{self, Store};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::params;
@@ -86,7 +99,7 @@ pub fn run(store: &Store, o: &Opts) -> Result<()> {
         Some(x) => bail!("unknown backend {x} (use mysql, pgsql or ldap)"),
         None => detect_backend(&o.postfix_dir)?,
     };
-    println!("iRedMail backend: {backend:?}");
+    say!("iRedMail backend: {backend:?}");
     let mut snap = match backend {
         Backend::Mysql | Backend::Pgsql => read_sql(backend, o)?,
         Backend::Ldap => read_ldap(o)?,
@@ -99,7 +112,7 @@ pub fn run(store: &Store, o: &Opts) -> Result<()> {
         }
     }
     let dkim = read_dkim(&snap.domains, &snap.alias_domains);
-    println!(
+    say!(
         "Found {} domain(s), {} alias domain(s), {} mailbox(es), {} alias/forwarding rule(s), {} DKIM key(s)",
         snap.domains.len(),
         snap.alias_domains.len(),
@@ -108,18 +121,18 @@ pub fn run(store: &Store, o: &Opts) -> Result<()> {
         dkim.len()
     );
     for w in &snap.warnings {
-        println!("  note: {w}");
+        say!("  note: {w}");
     }
     if o.dry_run {
         for u in &snap.users {
-            println!(
+            say!(
                 "  {:40} {}  maildir: {}",
                 u.email,
                 if u.enabled { "active " } else { "disabled" },
                 u.maildir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())
             );
         }
-        println!("Dry run: nothing written.");
+        say!("Dry run: nothing written.");
         return Ok(());
     }
 
@@ -130,7 +143,7 @@ pub fn run(store: &Store, o: &Opts) -> Result<()> {
             if let Some(dir) = &u.maildir {
                 match import_maildir(store, &u.email, dir, &mut rep) {
                     Ok(()) => {}
-                    Err(e) => println!("  warning: mail for {}: {e:#}", u.email),
+                    Err(e) => say!("  warning: mail for {}: {e:#}", u.email),
                 }
             }
         }
@@ -138,17 +151,17 @@ pub fn run(store: &Store, o: &Opts) -> Result<()> {
     if o.calendars {
         match import_sogo(store, &snap, &mut rep) {
             Ok(true) => {}
-            Ok(false) => println!("  SOGo not found; skipping calendars"),
-            Err(e) => println!("  warning: calendars: {e:#}"),
+            Ok(false) => say!("  SOGo not found; skipping calendars"),
+            Err(e) => say!("  warning: calendars: {e:#}"),
         }
     }
-    println!("\nImport complete:");
-    println!("  domains        {} (+{} alias domains, {} DKIM keys kept)", rep.domains, rep.alias_domains, rep.dkim);
-    println!("  users          {} new, {} updated", rep.users_new, rep.users_updated);
-    println!("  aliases        {}", rep.aliases);
-    println!("  mail           {} message(s) in {} folder(s) ({} already present)", rep.messages, rep.folders, rep.skipped);
-    println!("  calendars      {} with {} event(s), {} share(s)", rep.calendars, rep.events, rep.shares);
-    println!("\nUsers keep their current passwords. DKIM DNS records need no changes.");
+    say!("\nImport complete:");
+    say!("  domains        {} (+{} alias domains, {} DKIM keys kept)", rep.domains, rep.alias_domains, rep.dkim);
+    say!("  users          {} new, {} updated", rep.users_new, rep.users_updated);
+    say!("  aliases        {}", rep.aliases);
+    say!("  mail           {} message(s) in {} folder(s) ({} already present)", rep.messages, rep.folders, rep.skipped);
+    say!("  calendars      {} with {} event(s), {} share(s)", rep.calendars, rep.events, rep.shares);
+    say!("\nUsers keep their current passwords. DKIM DNS records need no changes.");
     Ok(())
 }
 
@@ -570,7 +583,7 @@ fn apply_accounts(store: &Store, s: &Snapshot, dkim: &HashMap<String, (String, S
                 (None, None) => {
                     let (pem, _) = crate::delivery::generate_dkim_key()?;
                     store::add_domain(c, d, "pw1", &pem)?;
-                    println!("  {d}: no existing DKIM key found; generated one (selector pw1) – publish it with `postwright domain dns {d}`");
+                    say!("  {d}: no existing DKIM key found; generated one (selector pw1) – publish it with `postwright domain dns {d}`");
                 }
                 (Some(_), Some((sel, pem))) => {
                     store::set_dkim(c, d, sel, pem)?;
@@ -621,7 +634,7 @@ fn apply_accounts(store: &Store, s: &Snapshot, dkim: &HashMap<String, (String, S
             }
             match store::add_alias(c, a, t) {
                 Ok(()) => rep.aliases += 1,
-                Err(e) => println!("  skipped alias {a} -> {t}: {e}"),
+                Err(e) => say!("  skipped alias {a} -> {t}: {e}"),
             }
         }
         Ok(())
@@ -828,7 +841,7 @@ fn import_maildir(store: &Store, email: &str, root: &Path, rep: &mut Report) -> 
         rep.messages += n;
         count += n;
     }
-    println!("  {email}: {count} message(s) imported");
+    say!("  {email}: {count} message(s) imported");
     Ok(())
 }
 

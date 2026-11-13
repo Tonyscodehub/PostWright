@@ -593,3 +593,51 @@ mod tests {
         assert_eq!(dechunk(b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"), b"hello world");
     }
 }
+
+// ------------------------------------------------------------------ health
+
+async fn ping(addr: &str, req: &[u8], expect: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut s = connect(addr).await?;
+        s.write_all(req).await?;
+        s.flush().await?;
+        let mut buf = vec![0u8; 512];
+        let n = s.read(&mut buf).await?;
+        let text = String::from_utf8_lossy(&buf[..n]).to_ascii_uppercase();
+        if text.contains(expect) {
+            Ok(())
+        } else {
+            bail!("unexpected reply: {}", text.trim())
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out"))?
+}
+
+/// Reachability of each configured scanner, for the admin console.
+pub async fn health(srv: &Shared) -> Vec<serde_json::Value> {
+    let f = &srv.cfg.filter;
+    let mut out = Vec::new();
+    let mut push = |name: &str, addr: &str, r: Result<()>| {
+        out.push(serde_json::json!({
+            "name": name, "address": addr, "ok": r.is_ok(),
+            "detail": r.err().map(|e| format!("{e:#}")).unwrap_or_else(|| "responding".into()),
+        }));
+    };
+    if let Some(c) = &f.clamav {
+        push("ClamAV", &c.address, ping(&c.address, b"zPING\0", "PONG").await);
+    }
+    if let Some(r) = &f.rspamd {
+        let res = async {
+            let u = parse_url(&r.url)?;
+            let req = format!("GET {}/ping HTTP/1.0\r\nHost: {}\r\n\r\n", u.path, u.host);
+            ping(&format!("{}:{}", u.host, u.port), req.as_bytes(), "PONG").await
+        }
+        .await;
+        push("Rspamd", &r.url, res);
+    }
+    if let Some(s) = &f.spamassassin {
+        push("SpamAssassin", &s.address, ping(&s.address, b"PING SPAMC/1.5\r\n\r\n", "PONG").await);
+    }
+    out
+}

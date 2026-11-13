@@ -53,7 +53,7 @@ pub fn xml_resp(code: StatusCode, s: String) -> Resp {
     builder(code).header("Content-Type", "application/xml; charset=utf-8").body(Full::new(Bytes::from(s))).unwrap()
 }
 
-fn json<T: serde::Serialize>(code: StatusCode, v: &T) -> Resp {
+pub(crate) fn json<T: serde::Serialize>(code: StatusCode, v: &T) -> Resp {
     builder(code)
         .header("Content-Type", "application/json")
         .header("Cache-Control", "no-store")
@@ -61,7 +61,7 @@ fn json<T: serde::Serialize>(code: StatusCode, v: &T) -> Resp {
         .unwrap()
 }
 
-fn json_err(code: StatusCode, msg: &str) -> Resp {
+pub(crate) fn json_err(code: StatusCode, msg: &str) -> Resp {
     json(code, &serde_json::json!({ "error": msg }))
 }
 
@@ -142,6 +142,12 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     if p.ends_with("/mail/config-v1.1.xml") {
         return autoconfig(&srv, &r);
     }
+    if p == "/admin.js" {
+        return builder(StatusCode::OK)
+            .header("Content-Type", "application/javascript; charset=utf-8")
+            .body(Full::new(Bytes::from_static(ADMIN_JS.as_bytes())))
+            .unwrap();
+    }
     if p == "/settings.js" {
         return builder(StatusCode::OK)
             .header("Content-Type", "application/javascript; charset=utf-8")
@@ -149,7 +155,7 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
             .unwrap();
     }
     if p == "/favicon.ico" {
-        return text(StatusCode::NOT_FOUND, "");
+        return builder(StatusCode::NO_CONTENT).body(Full::default()).unwrap();
     }
     if r.method == "OPTIONS" && (p == "/" || p.starts_with("/dav")) {
         // Some clients probe OPTIONS before authenticating.
@@ -172,6 +178,25 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
             .header("Referrer-Policy", "no-referrer")
             .body(Full::new(Bytes::from_static(SETTINGS_HTML.as_bytes())))
             .unwrap();
+    }
+    if p == "/admin" || p == "/admin/" {
+        if !user.is_admin || !crate::admin::in_networks(peer.ip(), &srv.cfg.security.admin_networks) {
+            return text(StatusCode::FORBIDDEN, "Administration is not available for this account or from this network.");
+        }
+        return builder(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .header("Cache-Control", "no-store")
+            .header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
+            .header("X-Frame-Options", "DENY")
+            .header("Referrer-Policy", "no-referrer")
+            .body(Full::new(Bytes::from_static(ADMIN_HTML.as_bytes())))
+            .unwrap();
+    }
+    if let Some(rest) = p.strip_prefix("/api/v1/admin/") {
+        if r.method != "GET" && r.method != "DELETE" && !r.header("content-type").unwrap_or_default().starts_with("application/json") {
+            return json_err(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json");
+        }
+        return crate::admin::handle(&srv, peer.ip(), user, &r, rest).await;
     }
     if let Some(rest) = p.strip_prefix("/api/v1/") {
         return api(&srv, user, &r, rest).await;
@@ -235,6 +260,13 @@ fn forget_cached_logins(user_id: i64) {
     auth_cache().lock().unwrap().retain(|_, e| e.user_id != user_id);
 }
 
+/// Drop cached logins for an account (after an admin changes or removes it). Cached
+/// entries are keyed by credential hash, so clear any for this address's user id.
+pub fn forget_cached_logins_for(_email: &str) {
+    // Entries expire within five minutes anyway; clearing all is cheap and simplest.
+    auth_cache().lock().unwrap().clear();
+}
+
 // --------------------------------------------------------------------- API
 
 #[derive(Deserialize)]
@@ -283,7 +315,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
             Ok(json(
                 StatusCode::OK,
                 &serde_json::json!({
-                    "email": user.email, "quota_bytes": user.quota_bytes, "used_bytes": used,
+                    "email": user.email, "quota_bytes": user.quota_bytes, "used_bytes": used, "is_admin": user.is_admin,
                     "imap": { "host": host, "port": first_port(&srv.cfg.listeners.imaps, 993), "security": "tls" },
                     "smtp": { "host": host, "port": first_port(&srv.cfg.listeners.submissions, 465), "security": "tls" },
                     "caldav": format!("https://{host}{}/dav/", https_port_suffix(srv)),
@@ -438,3 +470,5 @@ fn autoconfig(srv: &Shared, r: &Req) -> Resp {
 
 const SETTINGS_HTML: &str = include_str!("web/settings.html");
 const SETTINGS_JS: &str = include_str!("web/settings.js");
+const ADMIN_HTML: &str = include_str!("web/admin.html");
+const ADMIN_JS: &str = include_str!("web/admin.js");

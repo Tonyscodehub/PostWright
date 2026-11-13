@@ -8,6 +8,8 @@ mod filter;
 mod http;
 mod imap;
 mod iredmail;
+mod logbuf;
+mod admin;
 mod net;
 mod prefs;
 mod server;
@@ -143,6 +145,13 @@ enum UserCmd {
     Remove { email: String },
     Disable { email: String },
     Enable { email: String },
+    /// Grant or revoke access to the admin console and admin API.
+    Admin {
+        email: String,
+        /// Revoke instead of grant.
+        #[arg(long)]
+        off: bool,
+    },
     /// Set or clear a user's out-of-office auto-reply.
     Vacation {
         email: String,
@@ -391,10 +400,11 @@ fn user_cmd(cfg: &Config, cmd: UserCmd) -> Result<()> {
                 let usage = st.sync(|c| store::user_usage(c, u.id))?;
                 let quota = if u.quota_bytes > 0 { format!("{} MB", u.quota_bytes / 1048576) } else { "unlimited".into() };
                 println!(
-                    "{:40} {:>8.1} MB used / {quota}{}",
+                    "{:40} {:>8.1} MB used / {quota}{}{}",
                     u.email,
                     usage as f64 / 1048576.0,
-                    if u.enabled { "" } else { "  [disabled]" }
+                    if u.enabled { "" } else { "  [disabled]" },
+                    if u.is_admin { "  [admin]" } else { "" }
                 );
             }
         }
@@ -415,6 +425,12 @@ fn user_cmd(cfg: &Config, cmd: UserCmd) -> Result<()> {
                 bail!("no such user");
             }
             println!("Enabled {email}");
+        }
+        UserCmd::Admin { email, off } => {
+            if !st.sync(|c| store::set_admin(c, &email, !off))? {
+                bail!("no such user");
+            }
+            println!("{email} is {} an administrator", if off { "no longer" } else { "now" });
         }
         UserCmd::Vacation { email, off, subject, message, from, until, internal_only } => {
             let u = st.sync(|c| store::find_user(c, &email))?.ok_or_else(|| anyhow!("no such user"))?;
@@ -557,11 +573,14 @@ fn queue_cmd(cfg: &Config, cmd: QueueCmd) -> Result<()> {
 
 fn serve(cfg: Config) -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(|| logbuf::Tee)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,lettre=warn,hickory=warn".into()),
         )
         .init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    admin::mark_start();
     rt.block_on(async move {
         let srv = server::Server::new(cfg).context("starting server")?;
         let l = srv.cfg.listeners.clone();

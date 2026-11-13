@@ -32,6 +32,13 @@ const fromLocal = (v) => (v ? Math.floor(new Date(v).getTime() / 1000) : null);
 async function load() {
   const me = await call("GET", "me");
   $("who").textContent = me.email;
+  if (me.is_admin) {
+    const a = document.createElement("a");
+    a.href = "/admin";
+    a.textContent = "Administration";
+    a.style.marginLeft = "16px";
+    $("who").after(a);
+  }
   $("caldav-url").textContent = me.caldav;
   settings = await call("GET", "settings");
   const v = settings.vacation, s = settings.signature;

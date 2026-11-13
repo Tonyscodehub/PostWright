@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postwright – Administration</title>
+<style>
+  :root { --ink:#1d2330; --muted:#5b6475; --line:#d9dee7; --bg:#f3f5f8; --card:#fff; --accent:#1f5f8b; --accent-soft:#e6eef5;
+          --ok:#2e7d32; --ok-soft:#e5f2e6; --warn:#a15c00; --warn-soft:#fbefdc; --err:#b3261e; --err-soft:#fae3e1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#e6e9ef; --muted:#9aa3b2; --line:#2e343d; --bg:#121519; --card:#1b1f25; --accent:#6aa9d8; --accent-soft:#1d2a36;
+            --ok:#7cc47f; --ok-soft:#1c2b1d; --warn:#e2a24c; --warn-soft:#2e2414; --err:#f08a80; --err-soft:#331c1a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); display:grid; grid-template-columns:210px 1fr; min-height:100vh; }
+  nav { background:var(--card); border-right:1px solid var(--line); padding:18px 0; position:sticky; top:0; height:100vh; }
+  nav h1 { font-size:18px; margin:0 20px 2px; }
+  nav .host { color:var(--muted); font-size:12px; margin:0 20px 18px; word-break:break-all; }
+  nav a { display:block; padding:8px 20px; color:var(--ink); text-decoration:none; border-left:3px solid transparent; }
+  nav a:hover { background:var(--accent-soft); }
+  nav a.active { border-left-color:var(--accent); background:var(--accent-soft); font-weight:600; }
+  nav .foot { position:absolute; bottom:16px; left:20px; right:20px; font-size:12px; color:var(--muted); }
+  nav .foot a { padding:0; border:0; display:inline; color:var(--accent); }
+  main { padding:24px 32px; max-width:1200px; }
+  h2 { margin:0 0 4px; font-size:22px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .card h3 { margin:0 0 10px; font-size:15px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:12px; margin-bottom:16px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .stat .n { font-size:24px; font-weight:650; }
+  .stat .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); font-weight:600; }
+  td, th { padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tr:last-child td { border-bottom:0; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:12px; font-weight:600; margin-right:4px; }
+  .ok { background:var(--ok-soft); color:var(--ok); } .warn { background:var(--warn-soft); color:var(--warn); }
+  .err { background:var(--err-soft); color:var(--err); } .info { background:var(--accent-soft); color:var(--accent); }
+  input[type=text], input[type=email], input[type=password], input[type=number], select {
+    padding:7px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; color:inherit; background:transparent; }
+  input[type=number] { width:100px; }
+  button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); padding:4px 10px; }
+  button.danger { background:transparent; color:var(--err); border:1px solid var(--line); padding:4px 10px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:180px; }
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; width:120px; display:inline-block; vertical-align:middle; margin-right:6px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .bar > span.full { background:var(--err); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; font:12px/1.45 ui-monospace, Consolas, monospace; max-height:560px; overflow:auto; white-space:pre-wrap; word-break:break-all; margin:0; }
+  code { font:12px ui-monospace, Consolas, monospace; background:var(--bg); padding:2px 5px; border-radius:4px; word-break:break-all; }
+  .muted { color:var(--muted); }
+  .toast { position:fixed; bottom:20px; right:20px; padding:10px 16px; border-radius:8px; color:#fff; font-weight:600; box-shadow:0 4px 16px rgba(0,0,0,.2); }
+  .toast.ok { background:var(--ok); } .toast.err { background:var(--err); }
+  .edit { background:var(--bg); }
+  .edit td { padding:12px 8px; }
+  .dns td code { display:block; max-width:520px; }
+  label.c { display:inline-flex; gap:6px; align-items:center; }
+  @media (max-width: 760px) { body { grid-template-columns:1fr; } nav { position:static; height:auto; } nav .foot { position:static; margin-top:10px; } }
+</style>
+</head>
+<body>
+<nav>
+  <h1>Postwright</h1>
+  <div class="host" id="host"></div>
+  <a href="#overview">Overview</a>
+  <a href="#domains">Domains</a>
+  <a href="#users">Users</a>
+  <a href="#aliases">Aliases</a>
+  <a href="#queue">Mail queue</a>
+  <a href="#filters">Spam &amp; antivirus</a>
+  <a href="#import">Import from iRedMail</a>
+  <a href="#logs">Logs</a>
+  <div class="foot"><a href="/">My settings</a> · <span id="ver"></span></div>
+</nav>
+<main id="main"></main>
+<script src="/admin.js"></script>
+</body>
+</html>

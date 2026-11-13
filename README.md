@@ -10,6 +10,7 @@ One binary provides:
 - **CalDAV calendars with sharing** over HTTPS on 443
 - **Out-of-office auto-replies** and **server-stored signatures**
 - **A settings web page and JSON API**, plus Thunderbird-style **autoconfig**
+- **An admin console**, both in the browser at `/admin` and as a Windows desktop app (**Postwright Admin**)
 - An **outbound queue** with MX failover, retries with back-off, and bounce reports
 - **Antispam and antivirus filtering**: built-in checks, plus ClamAV, Rspamd, and SpamAssassin plugins
 - **One-command migration from iRedMail**, keeping passwords, DKIM keys, mail, and calendars
@@ -213,10 +214,43 @@ All endpoints use HTTP Basic auth (email and password) over HTTPS. State-changin
 
 ## Administration
 
+### Admin console and desktop app
+
+Give an account admin rights first:
+
+```sh
+postwright user admin tony@example.com
+```
+
+Then use either:
+
+- **Web console:** `https://mail.example.com/admin`, which works in any browser.
+- **Postwright Admin:** the Windows desktop app (`postwright-admin.exe`). Sign in with the server name, your email, and your password. If the server uses a self-signed certificate, the app shows its SHA-256 fingerprint and asks you to trust it once. After that it only accepts that exact certificate. Your password is never saved.
+
+Both offer the same tools:
+
+- **Overview:** counts, storage, scanner health, and the server's DNS and reverse DNS.
+- **Domains:** add a domain (DKIM key generated), add an alias domain, set a catch-all, and remove a domain. A live DNS check shows each MX, SPF, DKIM, and DMARC record to publish, whether it's live, and a copy button.
+- **Users:** search, add, set quotas, reset passwords, enable or disable, and grant admin rights. Shows usage, out-of-office status, and imported passwords.
+- **Aliases:** add and remove.
+- **Mail queue:** see retries and errors, retry now, or delete a message.
+- **Spam and antivirus:** thresholds, blocklists, and whether each scanner is responding.
+- **Import from iRedMail:** dry run or full import, with live output.
+- **Logs:** the last 2,000 lines, with a filter and live updates.
+
+**Security:**
+
+- Only accounts with the admin flag can use the console or app.
+- They only work **from the networks in `security.admin_networks`**: loopback and private ranges by default, so it isn't exposed to the internet.
+- State-changing requests need JSON or an `X-Requested-With` header, which blocks cross-site attacks.
+- You can't remove your own admin rights, disable yourself, or delete yourself.
+
+### Command line
+
 ```text
 postwright domain   add | alias | list | remove | dns | catch-all
 postwright import   iredmail
-postwright user     add | passwd | list | remove | disable | enable | vacation | signature
+postwright user     add | passwd | list | remove | disable | enable | admin | vacation | signature
 postwright alias    add | remove | list
 postwright calendar list | create | share | unshare
 postwright queue    list | flush
@@ -259,11 +293,11 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 ## Building
 
 ```sh
-cargo build --release
+cargo build --release                       # server and desktop app (workspace)
 # Static Linux binary (runs on any distribution):
 rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl
 # Windows from Linux:
-rustup target add x86_64-pc-windows-gnu && cargo build --release --target x86_64-pc-windows-gnu
+rustup target add x86_64-pc-windows-gnu && cargo build --release --target x86_64-pc-windows-gnu --workspace
 ```
 
 ## Licence

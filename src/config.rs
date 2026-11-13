@@ -107,6 +107,9 @@ pub struct SecurityConfig {
     pub max_auth_failures: u32,
     /// Window and block length, seconds.
     pub auth_block_secs: u64,
+    /// Networks (CIDR) the admin console and admin API may be used from. Defaults to
+    /// loopback and private ranges, so administration isn't exposed to the internet.
+    pub admin_networks: Vec<String>,
 }
 
 impl Default for Config {
@@ -189,7 +192,14 @@ impl Default for QueueConfig {
 
 impl Default for SecurityConfig {
     fn default() -> Self {
-        Self { max_auth_failures: 5, auth_block_secs: 900 }
+        Self {
+            max_auth_failures: 5,
+            auth_block_secs: 900,
+            admin_networks: ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
     }
 }
 
