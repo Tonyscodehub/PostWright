@@ -32,6 +32,40 @@ It works with Mailwright, Thunderbird, Apple Mail and Calendar, Outlook (IMAP), 
   - Inbound mail failing DMARC with `p=reject` is rejected.
 - **TLS 1.2 and 1.3 only**, via rustls. No OpenSSL.
 
+## System requirements
+
+Postwright itself is light. Almost all the memory goes to the optional ClamAV and spam-filter plugins.
+
+**Postwright on its own** (measured):
+
+- **Memory:** about 12 MB at idle, under 100 MB under load. Password checks use about 19 MB each by design, and they're capped at 2 to 8 at a time (depending on CPU cores), so memory stays flat under a login flood.
+- **CPU:** any x86-64 processor. One core is plenty for a household or small business; it handled about 1,400 messages a second over TLS in testing.
+- **Disk:** your mail plus a few percent for the database. An SSD is recommended. Identical messages are stored only once.
+
+**Optional scanners** (typical figures):
+
+| Component | RAM |
+|---|---|
+| ClamAV | about 1.5 GB, roughly double while it reloads virus definitions (set `ConcurrentDatabaseReload no` in `clamd.conf` to avoid the spike) |
+| Rspamd | 200 to 500 MB |
+| SpamAssassin | 150 to 300 MB (normally use Rspamd *or* SpamAssassin, not both) |
+
+**Suggested specs:**
+
+| Setup | CPU | RAM | Disk |
+|---|---|---|---|
+| Postwright only (built-in spam checks) | 1 core | 512 MB to 1 GB | SSD, mail size + 25% |
+| With ClamAV and Rspamd (recommended) | 2 cores | 4 GB | SSD, mail size + 25% |
+| Busier (dozens of users, heavy mail) | 4 cores | 8 GB | SSD, mail size + 25% |
+
+**Platforms:**
+
+- **Linux:** the static x86-64 binary runs on any distribution, including Rocky, Alma, RHEL, Debian, and Ubuntu.
+- **Windows:** Windows 10, 11, or Server 2016 and later, x86-64.
+- **Desktop app:** Postwright Admin needs Windows 10 or later with OpenGL 2 or newer, which any current graphics driver provides.
+
+ClamAV and Rspamd are Linux services. With Postwright on Windows, run them on a small Linux VM or container and point Postwright at their network addresses. The built-in checks still run locally.
+
 ## Quick start
 
 ```sh
