@@ -70,13 +70,55 @@ You also need one A/AAAA record for the host name. You also need **reverse DNS (
 
 ## TLS certificates
 
-Use a real certificate before going live. With Let's Encrypt:
+Postwright watches its certificate files and **switches to a renewed certificate within seconds, with no restart**, on Windows and Linux alike. If the files are caught mid-update (for example a new certificate but the old key), it keeps the current certificate until both match. It also warns in the log when expiry is under 14 days.
 
-```sh
-certbot certonly --standalone -d mail.example.com --deploy-hook "systemctl reload postwright"
+### Pushed from OPNsense (recommended)
+
+Postwright includes a small **upload-only SFTP receiver** (port 2222 by default). OPNsense's ACME client can push renewals straight to it with its standard automation. There's no OpenSSH server to install on Windows and no root SSH access to grant on Linux.
+
+1. In OPNsense, go to **Services > ACME Client > Automations** and add an automation with **Run Command: Upload certificate via SFTP**. Fill in:
+   - **Host:** Postwright's LAN address
+   - **Port:** `2222`
+   - **Username:** `acme`
+   - **Remote path:** leave blank
+   - **Identity type:** any
+2. Click **Show identity** and allow that key in Postwright, either on the console's **Certificate** page or with:
+   ```sh
+   postwright cert key-add 'from="192.168.1.1",restrict ssh-rsa AAAA… root@OPNsense'
+   ```
+   Paste the whole line OPNsense shows. Postwright ignores the restriction prefix.
+3. Click **Test Connect**. Compare the host key OPNsense records with the fingerprint shown by `postwright cert status` or the Certificate page.
+4. Attach the automation to the certificate under **Certificates**, then click **Run automations** once.
+
+Every upload is checked before it's used:
+
+- The private key must match the certificate.
+- The certificate must not have expired.
+- It must cover the server's host name (turn this off with `certs.require_hostname_match = false`).
+
+A rejected upload leaves the current certificate in place and logs why.
+
+**How the receiver is locked down:**
+
+- Public-key logins only, for keys you've allowed, and only from `security.admin_networks`.
+- There's no shell or command execution, and nothing can be downloaded.
+- Uploads are held in memory, and only certificate files are acted on.
+- Failed logins count towards the same brute-force block as mail logins.
+
+### Other ways
+
+- **Copy the files into place** (certbot deploy hook, SMB share, scp to a Linux box). They're picked up automatically.
+- **From the console:** paste a full chain and key on the Certificate page.
+- **From the command line:** `postwright cert install --fullchain fullchain.pem --key privkey.pem`
+
+These also validate the certificate and key before installing them.
+
+```toml
+[certs]
+sftp_listen = ["0.0.0.0:2222"]   # [] to disable the receiver
+sftp_user = "acme"
+require_hostname_match = true
 ```
-
-Then set `tls.cert = "/etc/letsencrypt/live/mail.example.com/fullchain.pem"` and the matching `privkey.pem` in `postwright.toml`. Postwright reloads the certificate on `SIGHUP` (Unix) and every 12 hours on every platform, so renewals need no restart.
 
 ## Outbound reputation
 
@@ -225,7 +267,7 @@ postwright user admin tony@example.com
 Then use either:
 
 - **Web console:** `https://mail.example.com/admin`, which works in any browser.
-- **Postwright Admin:** the Windows desktop app (`postwright-admin.exe`). Sign in with the server name, your email, and your password. If the server uses a self-signed certificate, the app shows its SHA-256 fingerprint and asks you to trust it once. After that it only accepts that exact certificate. Your password is never saved.
+- **Postwright Admin:** the Windows desktop app (`postwright-admin.exe`). Sign in with the server name, your email, and your password. If the server uses a self-signed certificate, the app shows its SHA-256 fingerprint and asks you to trust it once. After that it only accepts that exact certificate. When the certificate is renewed, the app either notices it's now publicly trusted and stops pinning, or shows the new fingerprint for you to check. Your password is never saved.
 
 Both offer the same tools:
 
@@ -235,6 +277,7 @@ Both offer the same tools:
 - **Aliases:** add and remove.
 - **Mail queue:** see retries and errors, retry now, or delete a message.
 - **Spam and antivirus:** thresholds, blocklists, and whether each scanner is responding.
+- **Certificate:** expiry and names, step-by-step OPNsense setup values, the keys allowed to push certificates, and manual install.
 - **Import from iRedMail:** dry run or full import, with live output.
 - **Logs:** the last 2,000 lines, with a filter and live updates.
 
@@ -249,6 +292,7 @@ Both offer the same tools:
 
 ```text
 postwright domain   add | alias | list | remove | dns | catch-all
+postwright cert     status | key-add | key-list | key-remove | install
 postwright import   iredmail
 postwright user     add | passwd | list | remove | disable | enable | admin | vacation | signature
 postwright alias    add | remove | list
@@ -280,7 +324,7 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 ## Deployment
 
 - **Linux:** the release binary is fully static (musl), so it runs on any x86-64 distribution. See `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
-- **Windows:** `postwright.exe serve` runs as-is. Use NSSM or `sc.exe` to run it as a service.
+- **Windows:** `postwright.exe serve` runs as-is. Use NSSM or `sc.exe` to run it as a service. Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
 
 ## Not yet included
 

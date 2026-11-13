@@ -3,7 +3,7 @@
 
 mod api;
 
-use api::{seg, Client, ConnectError};
+use api::{seg, Client, ConnectError, Pin};
 use eframe::egui::{self, Align, Color32, Layout, RichText};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ enum Page {
     Aliases,
     Queue,
     Filters,
+    Certificate,
     Import,
     Logs,
 }
@@ -30,12 +31,13 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Aliases, "Aliases"),
     (Page::Queue, "Mail queue"),
     (Page::Filters, "Spam & antivirus"),
+    (Page::Certificate, "Certificate"),
     (Page::Import, "Import from iRedMail"),
     (Page::Logs, "Logs"),
 ];
 
 enum Msg {
-    LoggedIn(Client, Value),
+    LoggedIn(Client, Value, Pin),
     LoginFailed(ConnectError),
     Loaded(Page, Result<Value, String>),
     Done(Page, String, Result<Value, String>),
@@ -88,6 +90,7 @@ struct App {
     login_busy: bool,
     login_error: Option<String>,
     pending_cert: Option<String>,
+    cert_changed: bool,
     client: Option<Client>,
     page: Page,
     tx: Sender<Msg>,
@@ -101,6 +104,10 @@ struct App {
     aliases: Vec<Value>,
     queue: Vec<Value>,
     filters: Option<Value>,
+    certs: Option<Value>,
+    cert_key_line: String,
+    cert_chain: String,
+    cert_pem_key: String,
     import: Option<Value>,
     logs: Vec<String>,
     dns: BTreeMap<String, Result<Value, String>>,
@@ -145,6 +152,7 @@ impl App {
             login_busy: false,
             login_error: None,
             pending_cert: None,
+            cert_changed: false,
             client: None,
             page: Page::Overview,
             tx,
@@ -157,6 +165,10 @@ impl App {
             aliases: vec![],
             queue: vec![],
             filters: None,
+            certs: None,
+            cert_key_line: String::new(),
+            cert_chain: String::new(),
+            cert_pem_key: String::new(),
             import: None,
             logs: vec![],
             dns: BTreeMap::new(),
@@ -199,7 +211,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let msg = match Client::connect(&server, &email, &pw, pin) {
-                Ok((c, v)) => Msg::LoggedIn(c, v),
+                Ok((c, v, p)) => Msg::LoggedIn(c, v, p),
                 Err(e) => Msg::LoginFailed(e),
             };
             let _ = tx.send(msg);
@@ -226,6 +238,7 @@ impl App {
             Page::Aliases => "aliases".into(),
             Page::Queue => "queue".into(),
             Page::Filters => "filters".into(),
+            Page::Certificate => "certs".into(),
             Page::Import => "import".into(),
             Page::Logs => format!("logs?n=800&q={}", seg(&self.log_filter)),
         };
@@ -250,8 +263,12 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, m: Msg) {
         match m {
-            Msg::LoggedIn(c, v) => {
+            Msg::LoggedIn(c, v, pin) => {
                 self.login_busy = false;
+                if let Pin::Drop = pin {
+                    self.saved.pins.remove(&api::normalise_url(&self.saved.server));
+                    self.toast("The server now has a publicly trusted certificate", true);
+                }
                 self.password.clear();
                 self.client = Some(c);
                 self.overview = Some(v);
@@ -260,6 +277,12 @@ impl App {
             }
             Msg::LoginFailed(ConnectError::UntrustedCert(fp)) => {
                 self.login_busy = false;
+                self.cert_changed = false;
+                self.pending_cert = Some(fp);
+            }
+            Msg::LoginFailed(ConnectError::CertChanged(fp)) => {
+                self.login_busy = false;
+                self.cert_changed = true;
                 self.pending_cert = Some(fp);
             }
             Msg::LoginFailed(ConnectError::Other(e)) => {
@@ -278,6 +301,7 @@ impl App {
                             Page::Aliases => self.aliases = arr(),
                             Page::Queue => self.queue = arr(),
                             Page::Filters => self.filters = Some(v.clone()),
+                            Page::Certificate => self.certs = Some(v.clone()),
                             Page::Import => self.import = Some(v.clone()),
                             Page::Logs => {
                                 self.logs = v["lines"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(String::from)).collect()).unwrap_or_default()
@@ -357,13 +381,18 @@ impl App {
 
         if let Some(fp) = self.pending_cert.clone() {
             let mut decision: Option<bool> = None;
-            egui::Window::new("Untrusted certificate")
+            let changed = self.cert_changed;
+            egui::Window::new(if changed { "Certificate changed" } else { "Untrusted certificate" })
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(&ctx, |ui| {
                     ui.set_max_width(460.0);
-                    ui.label("This server's certificate isn't signed by a public authority (it may be self-signed).");
+                    if changed {
+                        ui.label("The server's certificate has changed since you last trusted it. That's expected after a renewal, but the new certificate isn't signed by a public authority, so check it before trusting it.");
+                    } else {
+                        ui.label("This server's certificate isn't signed by a public authority (it may be self-signed).");
+                    }
                     ui.label("Only trust it if this fingerprint matches the one on your server:");
                     ui.add_space(6.0);
                     ui.label(RichText::new(&fp).monospace().small());
@@ -447,6 +476,18 @@ impl App {
                 } else {
                     ui.label(addrs.join(", "));
                 }
+                ui.end_row();
+                ui.label("TLS certificate");
+                ui.horizontal(|ui| {
+                    let c = &o["certificate"];
+                    if c.is_null() {
+                        pill(ui, "Unreadable", Tone::Bad);
+                    } else {
+                        let days = c["days_left"].as_i64().unwrap_or(0);
+                        pill(ui, &format!("{days} days left"), if days < 14 { Tone::Bad } else if days < 30 { Tone::Warn } else { Tone::Good });
+                        ui.label(list(&c["names"]).join(", "));
+                    }
+                });
                 ui.end_row();
                 ui.label("Reverse DNS");
                 ui.horizontal(|ui| {
@@ -884,6 +925,137 @@ impl App {
         ui.label(RichText::new("These settings live in postwright.toml; restart the server after changing them.").small());
     }
 
+    fn cert_view(&mut self, ui: &mut egui::Ui) {
+        self.header(ui, "Certificate", "Renewed certificates are picked up automatically: pushed by OPNsense, or copied into place any other way.");
+        let ctx = ui.ctx().clone();
+        let Some(d) = self.certs.clone() else { return };
+        let host = s(&d["hostname"]);
+        card(ui, "Current certificate", |ui| {
+            let c = &d["current"];
+            if c.is_null() {
+                pill(ui, &s(&d["error"]), Tone::Bad);
+                return;
+            }
+            egui::Grid::new("cert").num_columns(2).spacing([24.0, 8.0]).show(ui, |ui| {
+                ui.label("Names");
+                ui.horizontal(|ui| {
+                    ui.label(list(&c["names"]).join(", "));
+                    if c["covers_hostname"].as_bool().unwrap_or(false) {
+                        pill(ui, &format!("Covers {host}"), Tone::Good);
+                    } else {
+                        pill(ui, &format!("Doesn't cover {host}"), Tone::Bad);
+                    }
+                });
+                ui.end_row();
+                ui.label("Issued by");
+                ui.horizontal(|ui| {
+                    ui.label(s(&c["issuer"]));
+                    if c["self_signed"].as_bool().unwrap_or(false) {
+                        pill(ui, "Self-signed", Tone::Warn);
+                    }
+                });
+                ui.end_row();
+                ui.label("Expires");
+                let days = c["days_left"].as_i64().unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(date(c["not_after"].as_i64().unwrap_or(0)));
+                    pill(ui, &format!("{days} days left"), if days < 14 { Tone::Bad } else if days < 30 { Tone::Warn } else { Tone::Good });
+                });
+                ui.end_row();
+                ui.label("SHA-256");
+                ui.label(RichText::new(s(&c["sha256"])).monospace().small());
+                ui.end_row();
+                if !d["last_install"].is_null() {
+                    ui.label("Last installed");
+                    ui.label(format!("{} – {}", date(d["last_install"]["at"].as_i64().unwrap_or(0)), s(&d["last_install"]["source"])));
+                    ui.end_row();
+                }
+            });
+        });
+        let rv = d["receiver"].clone();
+        card(ui, "Push renewals from OPNsense", |ui| {
+            let listen = list(&rv["listen"]);
+            if listen.is_empty() {
+                pill(ui, "Receiver disabled – set [certs] sftp_listen in postwright.toml", Tone::Warn);
+                return;
+            }
+            let port = listen[0].rsplit(':').next().unwrap_or("").to_string();
+            ui.label("Postwright has a built-in, upload-only SFTP receiver, so OPNsense's ACME client can deliver renewals directly – no SSH server needed.");
+            ui.add_space(4.0);
+            ui.label("1. In OPNsense: Services > ACME Client > Automations > Add, with Run Command \"Upload certificate via SFTP\".");
+            ui.label("2. Fill in:");
+            egui::Grid::new("opn").num_columns(3).spacing([18.0, 6.0]).show(ui, |ui| {
+                for (k, v, copy) in [
+                    ("Host", format!("this server's LAN address (or {host})"), false),
+                    ("Port", port.clone(), true),
+                    ("Username", s(&rv["user"]), true),
+                    ("Remote path", "anything (leave blank)".to_string(), false),
+                    ("Identity type", "any (ed25519 or RSA)".to_string(), false),
+                ] {
+                    ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
+                    ui.label(RichText::new(&v).monospace());
+                    if copy && ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(v.clone());
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.label("3. Click \"Show identity\" in OPNsense and paste the key below.");
+            ui.horizontal(|ui| {
+                ui.label("4. Click \"Test Connect\". The host key OPNsense records should be");
+                ui.label(RichText::new(s(&rv["host_key_fingerprint"])).monospace());
+                if ui.small_button("Copy key").clicked() {
+                    ui.ctx().copy_text(s(&rv["host_key"]));
+                }
+            });
+            ui.label("5. Attach the automation to your certificate, then use \"Run automations\" once to test.");
+        });
+        let keys = d["keys"].as_array().cloned().unwrap_or_default();
+        card(ui, "Keys allowed to push certificates", |ui| {
+            if keys.is_empty() {
+                ui.label("None yet.");
+            }
+            for k in &keys {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(s(&k["fingerprint"])).monospace());
+                    ui.label(s(&k["algorithm"]));
+                    ui.label(s(&k["comment"]));
+                    if ui.button(RichText::new("Remove").color(bad())).clicked() {
+                        self.confirm = Some(Confirm {
+                            text: "Stop this key pushing certificates?".into(),
+                            method: "DELETE",
+                            path: format!("certs/keys?fp={}", seg(&s(&k["fingerprint"])).replace('/', "%2F")),
+                            page: Page::Certificate,
+                            ok: "Key removed".into(),
+                        });
+                    }
+                });
+            }
+            ui.add(egui::TextEdit::multiline(&mut self.cert_key_line).hint_text("Paste OPNsense's identity, e.g. from=\"192.168.1.1\",restrict ssh-rsa AAAA… root@OPNsense").desired_rows(3).desired_width(f32::INFINITY));
+            if ui.button("Allow this key").clicked() {
+                let body = json!({"key": self.cert_key_line.trim()});
+                self.cert_key_line.clear();
+                self.action(&ctx, "POST", "certs/keys".into(), body, Page::Certificate, "Key allowed");
+            }
+        });
+        card(ui, "Install a certificate by hand", |ui| {
+            ui.label(RichText::new(format!("Checked before use: the key must match, it must not be expired, and it must cover {host}.")).small());
+            ui.columns(2, |cols| {
+                cols[0].label("Full chain");
+                cols[0].add(egui::TextEdit::multiline(&mut self.cert_chain).hint_text("-----BEGIN CERTIFICATE-----").desired_rows(6).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                cols[1].label("Private key");
+                cols[1].add(egui::TextEdit::multiline(&mut self.cert_pem_key).hint_text("-----BEGIN PRIVATE KEY-----").desired_rows(6).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+            });
+            if ui.button("Install").clicked() {
+                let body = json!({"fullchain": self.cert_chain, "key": self.cert_pem_key});
+                self.cert_pem_key.clear();
+                self.action(&ctx, "POST", "certs/upload".into(), body, Page::Certificate, "Certificate installed");
+            }
+        });
+    }
+
     fn import_view(&mut self, ui: &mut egui::Ui) {
         self.header(ui, "Import from iRedMail", "Runs on the server, so Postwright must be installed on the iRedMail machine (as root). Safe to run more than once.");
         let ctx = ui.ctx().clone();
@@ -1037,6 +1209,7 @@ impl eframe::App for App {
                     Page::Aliases => self.aliases_view(ui),
                     Page::Queue => self.queue_view(ui),
                     Page::Filters => self.filters_view(ui),
+                    Page::Certificate => self.cert_view(ui),
                     Page::Import => self.import_view(ui),
                     Page::Logs => self.logs_view(ui),
                 }
@@ -1220,6 +1393,29 @@ fn uptime(s: u64) -> String {
     } else {
         format!("{m}m")
     }
+}
+
+fn date(ts: i64) -> String {
+    // Days since epoch to a calendar date (UTC), without pulling in a date library.
+    let days = ts.div_euclid(86400);
+    let (mut y, mut d) = (1970i64, days);
+    loop {
+        let len = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if d < len {
+            break;
+        }
+        d -= len;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let months = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let mut m = 0;
+    while d >= months[m] {
+        d -= months[m];
+        m += 1;
+    }
+    format!("{} {} {}", d + 1, names[m], y)
 }
 
 fn when(ts: i64) -> String {

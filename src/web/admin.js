@@ -80,7 +80,10 @@ async function overview() {
       h("table", {},
         h("tr", {}, h("td", {}, "Host name"), h("td", {}, h("code", {}, o.hostname))),
         h("tr", {}, h("td", {}, "Addresses"), h("td", {}, dns.addresses.length ? dns.addresses.join(", ") : pill("No A/AAAA record", "err"))),
-        h("tr", {}, h("td", {}, "Reverse DNS"), h("td", {}, pill(dns.ptr_matches ? "Matches host name" : "Doesn't match", dns.ptr_matches ? "ok" : "warn"), " ", h("span", { class: "muted" }, dns.ptr.join(", ")))))),
+        h("tr", {}, h("td", {}, "Reverse DNS"), h("td", {}, pill(dns.ptr_matches ? "Matches host name" : "Doesn't match", dns.ptr_matches ? "ok" : "warn"), " ", h("span", { class: "muted" }, dns.ptr.join(", ")))),
+        h("tr", {}, h("td", {}, "TLS certificate"), h("td", {}, o.certificate
+          ? [pill(`${o.certificate.days_left} days left`, o.certificate.days_left < 14 ? "err" : o.certificate.days_left < 30 ? "warn" : "ok"), " ", h("a", { href: "#certificate" }, o.certificate.names.join(", "))]
+          : pill("Unreadable", "err"))))),
     h("div", { class: "card" }, h("h3", {}, "Scanners"), h("table", {}, scanners)),
     c.queue_failing ? h("div", { class: "card" }, pill(`${c.queue_failing} message(s) retrying`, "warn"), " ", h("a", { href: "#queue" }, "View queue")) : "");
 }
@@ -251,6 +254,54 @@ async function filters() {
     h("p", { class: "muted" }, "These settings live in postwright.toml; restart the server after changing them."));
 }
 
+// --------------------------------------------------------------- certificate
+async function certificate() {
+  const d = await api("GET", "certs");
+  const c = d.current, rv = d.receiver;
+  const days = c ? c.days_left : 0;
+  const expiry = c ? pill(`${days} days left`, days < 14 ? "err" : days < 30 ? "warn" : "ok") : "";
+  const copyBtn = (text) => h("button", { class: "ghost", onclick: () => navigator.clipboard.writeText(text).then(() => toast("Copied")) }, "Copy");
+  const keyBox = h("textarea", { placeholder: 'Paste OPNsense\'s identity here, e.g.  from="192.168.1.1",restrict ssh-rsa AAAA… root@OPNsense' });
+  const chain = h("textarea", { placeholder: "-----BEGIN CERTIFICATE-----  (full chain: certificate then intermediates)" });
+  const key = h("textarea", { placeholder: "-----BEGIN PRIVATE KEY-----" });
+  const port = rv.listen.length ? rv.listen[0].split(":").pop() : "";
+  page("Certificate", "Renewed certificates are picked up automatically: pushed by OPNsense, or copied into place any other way.",
+    h("div", { class: "card" }, h("h3", {}, "Current certificate"),
+      c ? h("table", { class: "kv" },
+        h("tr", {}, h("td", {}, "Names"), h("td", {}, c.names.join(", "), " ", c.covers_hostname ? pill("Covers " + d.hostname, "ok") : pill("Doesn't cover " + d.hostname, "err"))),
+        h("tr", {}, h("td", {}, "Issued by"), h("td", {}, c.issuer, " ", c.self_signed ? pill("Self-signed", "warn") : "")),
+        h("tr", {}, h("td", {}, "Expires"), h("td", {}, fmtTime(c.not_after), " ", expiry)),
+        h("tr", {}, h("td", {}, "SHA-256"), h("td", {}, h("code", {}, c.sha256))),
+        d.last_install ? h("tr", {}, h("td", {}, "Last installed"), h("td", {}, fmtTime(d.last_install.at), " – ", d.last_install.source)) : "")
+        : pill(d.error || "No certificate", "err")),
+    h("div", { class: "card" }, h("h3", {}, "Push renewals from OPNsense"),
+      rv.listen.length ? [
+        h("p", { class: "muted" }, "Postwright has a built-in, upload-only SFTP receiver, so OPNsense's ACME client can deliver renewals directly – no SSH server needed, on Windows or Linux."),
+        h("ol", { class: "steps" },
+          h("li", {}, "In OPNsense go to ", h("b", {}, "Services › ACME Client › Automations"), " and add one with ", h("b", {}, "Run Command: Upload certificate via SFTP"), "."),
+          h("li", {}, "Fill in: ", h("table", { class: "kv" },
+            h("tr", {}, h("td", {}, "Host"), h("td", {}, h("code", {}, "this server's LAN address (or " + d.hostname + ")"))),
+            h("tr", {}, h("td", {}, "Port"), h("td", {}, h("code", {}, port), " ", copyBtn(port))),
+            h("tr", {}, h("td", {}, "Username"), h("td", {}, h("code", {}, rv.user), " ", copyBtn(rv.user))),
+            h("tr", {}, h("td", {}, "Remote path"), h("td", {}, h("span", { class: "muted" }, "anything (leave blank)"))),
+            h("tr", {}, h("td", {}, "Identity type"), h("td", {}, h("span", { class: "muted" }, "any (ed25519 or RSA)"))))),
+          h("li", {}, "Click ", h("b", {}, "Show identity"), " in OPNsense, copy the key it shows, and paste it below."),
+          h("li", {}, "Click ", h("b", {}, "Test Connect"), ". When OPNsense records the host key, it should match: ", h("code", {}, rv.host_key_fingerprint), " ", copyBtn(rv.host_key)),
+          h("li", {}, "Attach the automation to your certificate under ", h("b", {}, "Certificates"), ", then use ", h("b", {}, "Run automations"), " once to test."))
+      ] : h("p", {}, pill("Receiver disabled", "warn"), " Set [certs] sftp_listen in postwright.toml to enable it.")),
+    h("div", { class: "card" }, h("h3", {}, "Keys allowed to push certificates"),
+      d.keys.length ? h("table", {}, d.keys.map((k) => h("tr", {}, h("td", {}, h("code", {}, k.fingerprint)), h("td", {}, k.algorithm), h("td", {}, k.comment),
+        h("td", { class: "muted" }, fmtTime(k.added)),
+        h("td", { style: "text-align:right" }, h("button", { class: "danger", onclick: () => confirm("Stop this key pushing certificates?") &&
+          act(() => api("DELETE", "certs/keys?fp=" + encodeURIComponent(k.fingerprint)), "Key removed") }, "Remove")))))
+        : h("p", { class: "muted" }, "None yet."),
+      keyBox, h("div", { class: "row", style: "margin-top:8px" }, h("button", { onclick: () => act(() => api("POST", "certs/keys", { key: keyBox.value }), "Key allowed") }, "Allow this key"))),
+    h("div", { class: "card" }, h("h3", {}, "Install a certificate by hand"),
+      h("p", { class: "muted" }, "Checked before use: the key must match, it must not be expired" + (d.require_hostname_match ? ", and it must cover " + d.hostname : "") + "."),
+      h("div", { class: "row" }, h("div", { class: "grow" }, h("b", {}, "Full chain"), chain), h("div", { class: "grow" }, h("b", {}, "Private key"), key)),
+      h("div", { class: "row", style: "margin-top:8px" }, h("button", { onclick: () => act(() => api("POST", "certs/upload", { fullchain: chain.value, key: key.value }), "Certificate installed") }, "Install"))));
+}
+
 // -------------------------------------------------------------------- import
 async function importPage() {
   const st = await api("GET", "import");
@@ -297,7 +348,7 @@ async function logs() {
 }
 
 // -------------------------------------------------------------------- router
-const pages = { overview, domains, users, aliases, queue, filters, import: importPage, logs };
+const pages = { overview, domains, users, aliases, queue, filters, certificate, import: importPage, logs };
 async function route() {
   clearTimeout(timer);
   const name = (location.hash || "#overview").slice(1);

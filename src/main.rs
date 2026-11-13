@@ -2,6 +2,7 @@
 
 mod auth;
 mod caldav;
+mod certs;
 mod config;
 mod delivery;
 mod filter;
@@ -65,6 +66,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CalendarCmd,
     },
+    /// TLS certificate status, manual install, and keys allowed to push certificates.
+    Cert {
+        #[command(subcommand)]
+        cmd: CertCmd,
+    },
     /// Migrate from another mail server.
     Import {
         #[command(subcommand)]
@@ -74,6 +80,27 @@ enum Cmd {
     Queue {
         #[command(subcommand)]
         cmd: QueueCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CertCmd {
+    /// Show the current certificate and how to push renewals from OPNsense.
+    Status,
+    /// Allow an SSH public key (e.g. OPNsense's "Show identity") to push certificates.
+    KeyAdd {
+        /// The whole public key line, in quotes.
+        key: String,
+    },
+    KeyList,
+    /// Remove an allowed key by its SHA256 fingerprint.
+    KeyRemove { fingerprint: String },
+    /// Install a certificate and key from files (validated first). A running server picks it up within seconds.
+    Install {
+        #[arg(long)]
+        fullchain: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
     },
 }
 
@@ -229,6 +256,7 @@ fn main() -> Result<()> {
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
         Cmd::Queue { cmd } => queue_cmd(&cfg, cmd),
         Cmd::Calendar { cmd } => calendar_cmd(&cfg, cmd),
+        Cmd::Cert { cmd } => cert_cmd(&cfg, cmd),
         Cmd::Import { cmd: ImportCmd::Iredmail { backend, postfix_dir, dry_run, no_mail, no_calendars, user, sql_cmd } } => {
             let st = open_store(&cfg)?;
             iredmail::run(
@@ -501,6 +529,65 @@ fn alias_cmd(cfg: &Config, cmd: AliasCmd) -> Result<()> {
     Ok(())
 }
 
+fn cert_cmd(cfg: &Config, cmd: CertCmd) -> Result<()> {
+    let st = open_store(cfg)?;
+    match cmd {
+        CertCmd::Status => {
+            match certs::current(cfg) {
+                Ok(i) => {
+                    println!("Certificate:  {}", i.names.join(", "));
+                    println!("Issuer:       {}", i.issuer);
+                    println!(
+                        "Expires:      {} ({} days){}",
+                        chrono::DateTime::from_timestamp(i.not_after, 0).unwrap_or_default().format("%d %b %Y"),
+                        i.days_left,
+                        if i.covers_hostname { "" } else { "  – does NOT cover the host name!" }
+                    );
+                }
+                Err(e) => println!("Certificate:  unreadable ({e:#})"),
+            }
+            let r = certs::receiver_info(cfg)?;
+            println!();
+            if r.listen.is_empty() {
+                println!("SFTP receiver: disabled ([certs] sftp_listen is empty)");
+            } else {
+                println!("SFTP receiver: {} as user '{}'", r.listen.join(", "), r.user);
+                println!("Host key:      {}", r.host_key_fingerprint);
+                println!("               {}", r.host_key);
+            }
+            let keys = st.sync(|c| certs::list_keys(c))?;
+            println!("Allowed keys:  {}", if keys.is_empty() { "none yet – add OPNsense's with `postwright cert key-add`".into() } else { keys.len().to_string() });
+            for k in keys {
+                println!("               {} {} {}", k.fingerprint, k.algorithm, k.comment);
+            }
+        }
+        CertCmd::KeyAdd { key } => {
+            let fp = st.sync(|c| certs::add_key(c, &key))?;
+            println!("Allowed {fp} to push certificates");
+        }
+        CertCmd::KeyList => {
+            for k in st.sync(|c| certs::list_keys(c))? {
+                println!("{} {} {}", k.fingerprint, k.algorithm, k.comment);
+            }
+        }
+        CertCmd::KeyRemove { fingerprint } => {
+            if !st.sync(|c| certs::remove_key(c, &fingerprint))? {
+                bail!("no such key");
+            }
+            println!("Removed");
+        }
+        CertCmd::Install { fullchain, key } => {
+            let chain = std::fs::read(&fullchain)?;
+            let k = std::fs::read(&key)?;
+            let info = certs::validate(&chain, &k, &cfg.hostname, cfg.certs.require_hostname_match)?;
+            std::fs::write(&cfg.tls.key, &k)?;
+            std::fs::write(&cfg.tls.cert, &chain)?;
+            println!("Installed certificate for {} (expires in {} days)", info.names.join(", "), info.days_left);
+        }
+    }
+    Ok(())
+}
+
 fn calendar_cmd(cfg: &Config, cmd: CalendarCmd) -> Result<()> {
     let st = open_store(cfg)?;
     let user = |e: &str| -> Result<store::User> { st.sync(|c| store::find_user(c, e))?.ok_or_else(|| anyhow!("no such user {e}")) };
@@ -598,19 +685,11 @@ fn serve(cfg: Config) -> Result<()> {
         server::listen(srv.clone(), "https", &l.https, true, http::handle).await?;
         tokio::spawn(delivery::run_queue(srv.clone()));
 
-        // Pick up renewed certificates: on SIGHUP (Unix) and every 12 hours everywhere.
-        {
-            let srv = srv.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
-                tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    if let Err(e) = srv.reload_tls() {
-                        tracing::error!("TLS reload failed: {e:#}");
-                    }
-                }
-            });
+        // Pick up renewed certificates as soon as the files change (any platform), and
+        // accept pushes from OPNsense's ACME client on the built-in SFTP receiver.
+        tokio::spawn(certs::watch(srv.clone()));
+        if let Err(e) = certs::run_receiver(srv.clone()).await {
+            tracing::error!("certificate receiver: {e:#}");
         }
         #[cfg(unix)]
         {

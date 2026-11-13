@@ -40,6 +40,9 @@
   input[type=text], input[type=email], input[type=password], input[type=number], select {
     padding:7px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; color:inherit; background:transparent; }
   input[type=number] { width:100px; }
+  textarea { width:100%; min-height:90px; padding:8px 10px; border:1px solid var(--line); border-radius:6px; font:12px ui-monospace, Consolas, monospace; color:inherit; background:transparent; }
+  ol.steps { margin:6px 0 0; padding-left:20px; } ol.steps li { margin:6px 0; }
+  .kv td:first-child { color:var(--muted); width:190px; }
   button { padding:7px 14px; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
   button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); padding:4px 10px; }
   button.danger { background:transparent; color:var(--err); border:1px solid var(--line); padding:4px 10px; }
@@ -71,6 +74,7 @@
   <a href="#aliases">Aliases</a>
   <a href="#queue">Mail queue</a>
   <a href="#filters">Spam &amp; antivirus</a>
+  <a href="#certificate">Certificate</a>
   <a href="#import">Import from iRedMail</a>
   <a href="#logs">Logs</a>
   <div class="foot"><a href="/">My settings</a> · <span id="ver"></span></div>

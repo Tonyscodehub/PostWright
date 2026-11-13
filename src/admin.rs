@@ -124,6 +124,17 @@ struct NewAlias {
     target: String,
 }
 
+#[derive(Deserialize)]
+struct NewKey {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct CertUpload {
+    fullchain: String,
+    key: String,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ImportReq {
@@ -139,6 +150,45 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
     let segs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
     match (r.method.as_str(), segs.as_slice()) {
         ("GET", ["overview"]) => overview(srv).await,
+
+        // ------------------------------------------------------------ certificate
+        ("GET", ["certs"]) => {
+            let (cur, err) = match crate::certs::current(&srv.cfg) {
+                Ok(i) => (Some(i), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            };
+            let keys = srv.store.call(|c| crate::certs::list_keys(c)).await?;
+            let last = crate::certs::LAST_INSTALL.lock().unwrap().clone();
+            Ok(j!({
+                "current": cur, "error": err, "hostname": srv.cfg.hostname,
+                "receiver": crate::certs::receiver_info(&srv.cfg)?,
+                "keys": keys,
+                "require_hostname_match": srv.cfg.certs.require_hostname_match,
+                "last_install": last.map(|(t, s)| j!({"at": t, "source": s})),
+            }))
+        }
+        ("POST", ["certs", "keys"]) => {
+            let k: NewKey = body(r)?;
+            let fp = srv.store.call(move |c| crate::certs::add_key(c, &k.key)).await?;
+            tracing::info!("admin {} allowed key {fp} to push certificates", me.email);
+            Ok(j!({ "fingerprint": fp }))
+        }
+        ("DELETE", ["certs", "keys"]) => {
+            let fp = query(r, "fp").ok_or_else(|| anyhow!("missing fp"))?;
+            let f2 = fp.clone();
+            if !srv.store.call(move |c| crate::certs::remove_key(c, &f2)).await? {
+                bail!("no such key");
+            }
+            tracing::info!("admin {} removed certificate push key {fp}", me.email);
+            Ok(j!({ "ok": true }))
+        }
+        ("POST", ["certs", "upload"]) => {
+            let u: CertUpload = body(r)?;
+            let srv2 = srv.clone();
+            let who = format!("admin {}", me.email);
+            let info = tokio::task::spawn_blocking(move || crate::certs::install(&srv2, u.fullchain.as_bytes(), u.key.as_bytes(), &who)).await??;
+            Ok(j!({ "installed": info }))
+        }
 
         // ---------------------------------------------------------------- domains
         ("GET", ["domains"]) => {
@@ -443,6 +493,7 @@ async fn overview(srv: &Shared) -> Result<Value> {
         "counts": counts,
         "server_dns": { "addresses": ips, "ptr": ptrs, "ptr_matches": ptr_ok },
         "scanners": crate::filter::health(srv).await,
+        "certificate": crate::certs::current(&srv.cfg).ok(),
         "filter_enabled": srv.cfg.filter.enabled,
         "recent_warnings": warnings,
         "listeners": {

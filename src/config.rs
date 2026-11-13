@@ -19,6 +19,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub security: SecurityConfig,
     pub filter: crate::filter::FilterConfig,
+    pub certs: crate::certs::CertConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,7 @@ impl Default for Config {
             queue: QueueConfig::default(),
             security: SecurityConfig::default(),
             filter: crate::filter::FilterConfig::default(),
+            certs: crate::certs::CertConfig::default(),
         }
     }
 }

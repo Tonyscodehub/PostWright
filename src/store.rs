@@ -196,6 +196,7 @@ fn migrate(c: &Connection) -> Result<()> {
         let cols = st.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
         Ok(cols.iter().any(|c| c == col))
     };
+    c.execute_batch(crate::certs::SCHEMA)?;
     if !has("users", "is_admin")? {
         c.execute_batch("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")?;
     }

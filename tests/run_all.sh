@@ -23,3 +23,7 @@ start postwright.toml; echo "features:"; timeout 150 python3 -I $T/e2e_features.
 # Scanner suite: real ClamAV, Rspamd and SpamAssassin must be running.
 start filter.toml;     echo "filters:";  timeout 150 python3 -I $T/filter_check.py | grep -E "FAIL|passed"
 stop
+# Certificate push suite (uses OpenSSH's sftp client).
+start filter.toml; echo "certs:"; cp /tmp/pwtest/data/tls/cert.pem /tmp/pwtest/cert.bak; cp /tmp/pwtest/data/tls/key.pem /tmp/pwtest/key.bak
+timeout 200 python3 -I $T/cert_check.py | grep -E "FAIL|passed"
+stop; cp /tmp/pwtest/cert.bak /tmp/pwtest/data/tls/cert.pem; cp /tmp/pwtest/key.bak /tmp/pwtest/data/tls/key.pem

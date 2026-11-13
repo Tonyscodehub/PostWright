@@ -20,7 +20,16 @@ pub struct Client {
 pub enum ConnectError {
     /// The certificate isn't publicly trusted; here is its SHA-256 fingerprint.
     UntrustedCert(String),
+    /// A previously trusted self-signed certificate was replaced by another untrusted one.
+    CertChanged(String),
     Other(String),
+}
+
+/// What the caller should do with its stored pin after a successful connection.
+pub enum Pin {
+    Keep,
+    /// The server now has a publicly trusted certificate; the pin is no longer needed.
+    Drop,
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -114,25 +123,30 @@ pub fn normalise_url(s: &str) -> String {
 
 impl Client {
     /// Sign in. `pinned` is the approved fingerprint for a self-signed server, if any.
-    pub fn connect(server: &str, email: &str, password: &str, pinned: Option<String>) -> Result<(Client, Value), ConnectError> {
+    pub fn connect(server: &str, email: &str, password: &str, pinned: Option<String>) -> Result<(Client, Value, Pin), ConnectError> {
         let base = normalise_url(server);
         let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{password}", email.trim())));
-        let mode = match &pinned {
-            Some(fp) => Verify::Pinned(fp.clone()),
-            None => Verify::Public,
-        };
-        let c = Client { base: base.clone(), auth, agent: agent(mode) };
+        let make = |mode| Client { base: base.clone(), auth: auth.clone(), agent: agent(mode) };
+        if let Some(fp) = &pinned {
+            let c = make(Verify::Pinned(fp.clone()));
+            match c.get("overview") {
+                Ok(v) => return Ok((c, v, Pin::Keep)),
+                Err(e) if !looks_like_cert_error(&e) => return Err(ConnectError::Other(e)),
+                Err(_) => {} // certificate changed: see below
+            }
+        }
+        let c = make(Verify::Public);
         match c.get("overview") {
-            Ok(v) => Ok((c, v)),
-            Err(e) if pinned.is_none() && looks_like_cert_error(&e) => {
+            Ok(v) => Ok((c, v, if pinned.is_some() { Pin::Drop } else { Pin::Keep })),
+            Err(e) if looks_like_cert_error(&e) => {
                 // Find out which certificate the server presented so the user can decide.
                 let seen = Arc::new(Mutex::new(None));
-                let probe = agent(Verify::Capture(seen.clone()));
-                let _ = probe.get(&format!("{base}/")).call();
+                let _ = agent(Verify::Capture(seen.clone())).get(&format!("{base}/")).call();
                 let fp = seen.lock().unwrap().clone();
-                match fp {
-                    Some(fp) => Err(ConnectError::UntrustedCert(fp)),
-                    None => Err(ConnectError::Other(e)),
+                match (fp, pinned.is_some()) {
+                    (Some(fp), true) => Err(ConnectError::CertChanged(fp)),
+                    (Some(fp), false) => Err(ConnectError::UntrustedCert(fp)),
+                    (None, _) => Err(ConnectError::Other(e)),
                 }
             }
             Err(e) => Err(ConnectError::Other(e)),
