@@ -151,6 +151,8 @@ pub struct Domain {
     pub dkim_selector: Option<String>,
     pub dkim_key: Option<String>,
     pub catch_all: Option<String>,
+    /// If set, this domain is an alias: local@name is delivered as local@alias_of.
+    pub alias_of: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +188,19 @@ pub struct QueueItem {
     pub next_attempt: i64,
 }
 
+/// Additive schema changes for databases created by earlier versions.
+fn migrate(c: &Connection) -> Result<()> {
+    let has = |table: &str, col: &str| -> Result<bool> {
+        let mut st = c.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols = st.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(cols.iter().any(|c| c == col))
+    };
+    if !has("domains", "alias_of")? {
+        c.execute_batch("ALTER TABLE domains ADD COLUMN alias_of TEXT")?;
+    }
+    Ok(())
+}
+
 pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -207,6 +222,7 @@ impl Store {
         std::fs::create_dir_all(blob_dir)?;
         let first = open_conn(db_path)?;
         first.execute_batch(SCHEMA)?;
+        migrate(&first)?;
         let mut conns = vec![Mutex::new(first)];
         for _ in 1..pool_size.max(1) {
             conns.push(Mutex::new(open_conn(db_path)?));
@@ -259,6 +275,19 @@ impl Store {
             let tmp = path.with_extension(format!("tmp{}", rand::random::<u32>()));
             tokio::fs::write(&tmp, &data[..]).await?;
             tokio::fs::rename(&tmp, &path).await?;
+        }
+        Ok(hash)
+    }
+
+    /// Blocking variant of `put_blob` for the CLI importer.
+    pub fn put_blob_sync(&self, data: &[u8]) -> Result<String> {
+        let hash = hex::encode(Sha256::digest(data));
+        let path = self.blob_path(&hash);
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let tmp = path.with_extension(format!("tmp{}", rand::random::<u32>()));
+            std::fs::write(&tmp, data)?;
+            std::fs::rename(&tmp, &path)?;
         }
         Ok(hash)
     }
@@ -393,12 +422,12 @@ pub fn user_usage(c: &Connection, user_id: i64) -> Result<i64> {
 }
 
 fn row_domain(r: &rusqlite::Row) -> rusqlite::Result<Domain> {
-    Ok(Domain { name: r.get(0)?, dkim_selector: r.get(1)?, dkim_key: r.get(2)?, catch_all: r.get(3)? })
+    Ok(Domain { name: r.get(0)?, dkim_selector: r.get(1)?, dkim_key: r.get(2)?, catch_all: r.get(3)?, alias_of: r.get(4)? })
 }
 
 pub fn find_domain(c: &Connection, name: &str) -> Result<Option<Domain>> {
     Ok(c.query_row(
-        "SELECT name, dkim_selector, dkim_key, catch_all FROM domains WHERE name = ?1",
+        "SELECT name, dkim_selector, dkim_key, catch_all, alias_of FROM domains WHERE name = ?1",
         [name.to_ascii_lowercase()],
         row_domain,
     )
@@ -406,7 +435,7 @@ pub fn find_domain(c: &Connection, name: &str) -> Result<Option<Domain>> {
 }
 
 pub fn list_domains(c: &Connection) -> Result<Vec<Domain>> {
-    let mut st = c.prepare("SELECT name, dkim_selector, dkim_key, catch_all FROM domains ORDER BY name")?;
+    let mut st = c.prepare("SELECT name, dkim_selector, dkim_key, catch_all, alias_of FROM domains ORDER BY name")?;
     let v = st.query_map([], row_domain)?.collect::<Result<Vec<_>, _>>()?;
     Ok(v)
 }
@@ -417,6 +446,25 @@ pub fn add_domain(c: &Connection, name: &str, selector: &str, key_pem: &str) -> 
         params![name.to_ascii_lowercase(), selector, key_pem],
     )?;
     Ok(())
+}
+
+pub fn add_alias_domain(c: &Connection, alias: &str, target: &str, dkim: Option<(&str, &str)>) -> Result<()> {
+    let target = target.to_ascii_lowercase();
+    if find_domain(c, &target)?.is_none() {
+        bail!("target domain {target} is not hosted here");
+    }
+    c.execute(
+        "INSERT INTO domains(name, alias_of, dkim_selector, dkim_key) VALUES(?1, ?2, ?3, ?4)",
+        params![alias.to_ascii_lowercase(), target, dkim.map(|d| d.0), dkim.map(|d| d.1)],
+    )?;
+    Ok(())
+}
+
+pub fn set_dkim(c: &Connection, domain: &str, selector: &str, key_pem: &str) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE domains SET dkim_selector = ?2, dkim_key = ?3 WHERE name = ?1",
+        params![domain.to_ascii_lowercase(), selector, key_pem],
+    )? > 0)
 }
 
 pub fn set_catch_all(c: &Connection, domain: &str, target: Option<&str>) -> Result<bool> {
@@ -471,6 +519,17 @@ pub fn sender_addresses(c: &Connection, user: &User) -> Result<Vec<String>> {
     let mut st = c.prepare("SELECT source FROM aliases WHERE target = ?1")?;
     let mut v = st.query_map([&user.email], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
     v.push(user.email.clone());
+    // local@alias-domain is the same mailbox as local@domain.
+    let mut extra = Vec::new();
+    for a in &v {
+        if let Some((local, dom)) = a.rsplit_once('@') {
+            let mut st = c.prepare("SELECT name FROM domains WHERE alias_of = ?1")?;
+            for d in st.query_map([dom], |r| r.get::<_, String>(0))? {
+                extra.push(format!("{local}@{}", d?));
+            }
+        }
+    }
+    v.extend(extra);
     Ok(v)
 }
 
@@ -632,6 +691,34 @@ pub fn append_message(
     blob_ref(&tx, blob, 1)?;
     tx.commit()?;
     Ok(uid as u32)
+}
+
+/// Insert a message keeping a specific UID (used when importing from Dovecot so mail
+/// clients don't need to re-download). Caller must ensure the UID is free.
+pub fn insert_with_uid(
+    c: &Connection,
+    mailbox_id: i64,
+    uid: u32,
+    blob: &str,
+    size: i64,
+    internal_date: i64,
+    flags: &[String],
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO messages(mailbox_id, uid, blob, size, internal_date, flags) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![mailbox_id, uid, blob, size, internal_date, flags_to_string(flags)],
+    )?;
+    c.execute("UPDATE mailboxes SET uidnext = MAX(uidnext, ?2 + 1) WHERE id = ?1", params![mailbox_id, uid])?;
+    blob_ref(c, blob, 1)?;
+    Ok(())
+}
+
+pub fn set_uid_state(c: &Connection, mailbox_id: i64, uidvalidity: u32, uidnext: u32) -> Result<()> {
+    c.execute(
+        "UPDATE mailboxes SET uidvalidity = ?2, uidnext = MAX(uidnext, ?3) WHERE id = ?1",
+        params![mailbox_id, uidvalidity, uidnext],
+    )?;
+    Ok(())
 }
 
 pub fn set_flags(c: &Connection, msg_id: i64, flags: &[String]) -> Result<()> {

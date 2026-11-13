@@ -891,6 +891,8 @@ impl Session {
             return Err(no("[READ-ONLY] Mailbox is read-only"));
         }
         let src = sel.mb.id;
+        let src_junk = is_junk(&sel.mb);
+        let blobs: Vec<String> = idx.iter().map(|&i| sel.msgs[i].blob.clone()).collect();
         let uids: Vec<u32> = idx.iter().map(|&i| sel.msgs[i].uid).collect();
         let res = self
             .srv
@@ -898,10 +900,17 @@ impl Session {
             .call(move |c| {
                 let Some(dst) = store::find_mailbox(c, user_id, &dest)? else { return Ok(None) };
                 let pairs = if mv { store::move_messages(c, src, dst.id, &uids)? } else { store::copy_messages(c, src, dst.id, &uids)? };
-                Ok(Some((dst.uidvalidity, pairs)))
+                Ok(Some((dst.uidvalidity, pairs, is_junk(&dst), dst.special.as_deref() == Some("\\Trash") || dst.name == "Trash")))
             })
             .await?;
-        let Some((validity, pairs)) = res else { return Err(no("[TRYCREATE] Destination mailbox does not exist")) };
+        let Some((validity, pairs, dst_junk, dst_trash)) = res else { return Err(no("[TRYCREATE] Destination mailbox does not exist")) };
+        // Moving mail into Junk teaches the spam filter; rescuing it from Junk teaches ham.
+        let email = self.user()?.email.clone();
+        if dst_junk && !src_junk {
+            crate::filter::learn(&self.srv, blobs, true, email);
+        } else if src_junk && !dst_junk && !dst_trash && !pairs.is_empty() {
+            crate::filter::learn(&self.srv, blobs, false, email);
+        }
         let code = if pairs.is_empty() {
             String::new()
         } else {
@@ -927,6 +936,10 @@ impl Session {
         }
         Ok((format!("OK {code}COPY completed"), Flow::Continue))
     }
+}
+
+fn is_junk(mb: &Mailbox) -> bool {
+    mb.special.as_deref() == Some("\\Junk") || mb.name.eq_ignore_ascii_case("Junk") || mb.name.eq_ignore_ascii_case("Spam")
 }
 
 fn mailbox_arg(args: &[Tok]) -> Result<String> {

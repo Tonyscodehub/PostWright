@@ -33,6 +33,8 @@ struct Session {
     rcpts: Vec<String>,
     declared_size: i64,
     errors: u32,
+    /// Connection-level spam evidence gathered before the banner (DNSBL, early talking).
+    pre: crate::filter::Verdict,
 }
 
 pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr, mode: Mode) -> Result<()> {
@@ -49,10 +51,34 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr, mode: Mode) -
         rcpts: vec![],
         declared_size: 0,
         errors: 0,
+        pre: Default::default(),
     };
     if mode == Mode::Submission && s.srv.guard.is_blocked(peer.ip()) {
         s.conn.send("421 4.7.0 Too many failed logins, try later").await?;
         return Ok(());
+    }
+    let f = &s.srv.cfg.filter;
+    if mode == Mode::Inbound && f.enabled {
+        // Pause before the banner (spambots talk first) while the DNSBL lookups run.
+        let srv = s.srv.clone();
+        let ip = peer.ip();
+        let bl = tokio::spawn(async move {
+            let mut v = crate::filter::Verdict::default();
+            crate::filter::dnsbl(&srv, ip, &mut v).await;
+            v
+        });
+        if f.greet_pause_ms > 0 && !crate::filter::is_private(ip) && s.conn.early_talk(Duration::from_millis(f.greet_pause_ms)).await {
+            s.pre.add(6.0, "EARLY_TALKER");
+        }
+        if let Ok(v) = bl.await {
+            s.pre.score += v.score;
+            s.pre.reasons.extend(v.reasons);
+        }
+        if s.pre.score >= f.reject_score {
+            tracing::info!("refused {}: {}", ip, s.pre.reasons.join(" "));
+            s.conn.send(&format!("554 5.7.1 {} is listed on a blocklist", ip)).await?;
+            return Ok(());
+        }
     }
     let banner = format!("220 {} ESMTP Postwright", s.srv.cfg.hostname);
     s.conn.send(&banner).await?;
@@ -399,6 +425,8 @@ impl Session {
         // Remove any Authentication-Results forged with our own authserv-id.
         let body = strip_forged_auth_results(&body, &host);
         let mut prefix = String::new();
+        let fcfg = self.srv.cfg.filter.clone();
+        let mut verdict = self.pre.clone();
         if self.srv.cfg.inbound.verify {
             let Some(msg) = AuthenticatedMessage::parse(&body) else {
                 return Ok("550 5.6.0 Malformed message".into());
@@ -430,6 +458,34 @@ impl Session {
                 return Ok("550 5.7.23 SPF validation failed".into());
             }
             let dkim_ok = dkim.iter().any(|d| *d.result() == DkimResult::Pass);
+            if fcfg.enabled {
+                match spf.result() {
+                    SpfResult::Fail => verdict.add(3.0, "SPF_FAIL"),
+                    SpfResult::SoftFail => verdict.add(1.0, "SPF_SOFTFAIL"),
+                    SpfResult::PermError => verdict.add(0.5, "SPF_PERMERROR"),
+                    _ => {}
+                }
+                if !dkim_ok && dkim.iter().any(|d| matches!(d.result(), DkimResult::Fail(_))) {
+                    verdict.add(1.0, "DKIM_INVALID");
+                }
+                if dmarc_pass {
+                    verdict.add(-1.0, "DMARC_PASS");
+                } else if dmarc_failed {
+                    match dmarc.policy() {
+                        mail_auth::dmarc::Policy::Reject => verdict.add(6.0, "DMARC_REJECT"),
+                        mail_auth::dmarc::Policy::Quarantine => verdict.add(3.0, "DMARC_QUARANTINE"),
+                        _ => verdict.add(1.5, "DMARC_NONE_FAIL"),
+                    }
+                }
+                if !crate::filter::is_private(ip) {
+                    let iprev = self.srv.dns.verify_iprev(ip).await;
+                    match iprev.result() {
+                        mail_auth::IprevResult::Pass => {}
+                        mail_auth::IprevResult::TempError(_) => {}
+                        _ => verdict.add(1.5, "FCRDNS_FAIL"),
+                    }
+                }
+            }
             tracing::info!(
                 "accepted from {ip} <{mail_from}> spf={:?} dkim={} dmarc={}",
                 spf.result(),
@@ -438,12 +494,35 @@ impl Session {
             );
             prefix.push_str(&ar.to_header());
         }
+        let mut junk = false;
+        if fcfg.enabled {
+            if !crate::filter::is_private(ip) {
+                crate::filter::helo_score(&helo, &mut verdict);
+            }
+            let rcpts = self.rcpts.clone();
+            let env = crate::filter::Envelope { ip, helo: &helo, mail_from: &mail_from, rcpts: &rcpts, user: None };
+            crate::filter::scan_content(&self.srv, &env, &body, &mut verdict).await;
+            match verdict.action(&fcfg) {
+                crate::filter::Action::Reject(r) | crate::filter::Action::Tempfail(r) => {
+                    tracing::info!("refused message from {ip} <{mail_from}>: {} [{}]", r, verdict.reasons.join(" "));
+                    return Ok(r);
+                }
+                crate::filter::Action::Junk => junk = true,
+                crate::filter::Action::Deliver => {}
+            }
+            if fcfg.add_headers {
+                prefix.push_str(&verdict.headers(&fcfg, &host));
+            }
+        }
         let with = if self.conn.stream.is_tls() { "ESMTPS" } else { "ESMTP" };
         let rcpt = if self.rcpts.len() == 1 { Some(self.rcpts[0].clone()) } else { None };
         let mut data = self.received_header(with, rcpt.as_deref()).into_bytes();
         data.extend_from_slice(prefix.as_bytes());
         data.extend_from_slice(&body);
-        let failed = delivery::deliver(&self.srv, &mail_from, &self.rcpts.clone(), data).await?;
+        if junk {
+            tracing::info!("filed as junk: <{mail_from}> score {:.1} [{}]", verdict.score, verdict.reasons.join(" "));
+        }
+        let failed = delivery::deliver_to(&self.srv, &mail_from, &self.rcpts.clone(), data, junk).await?;
         if failed.len() == self.rcpts.len() {
             return Ok("452 4.2.2 Could not deliver to any recipient".into());
         }
@@ -479,6 +558,27 @@ impl Session {
                 rand::random::<u64>(),
                 delivery::domain_of(&mail_from)
             ));
+        }
+        let fcfg = self.srv.cfg.filter.clone();
+        if fcfg.enabled && fcfg.scan_outbound {
+            let mut v = crate::filter::Verdict::default();
+            let rcpts = self.rcpts.clone();
+            let helo = self.helo.clone().unwrap_or_default();
+            let env = crate::filter::Envelope { ip: self.peer.ip(), helo: &helo, mail_from: &mail_from, rcpts: &rcpts, user: Some(&user.email) };
+            crate::filter::scan_content(&self.srv, &env, &body, &mut v).await;
+            // Outbound: block malware and anything the spam engine says to reject (a
+            // compromised account), but never junk-file a user's own mail.
+            if let Some(virus) = &v.virus {
+                tracing::warn!("blocked outbound malware from {}: {virus}", user.email);
+                return Ok(format!("554 5.7.1 Message contains malware ({virus})"));
+            }
+            if v.force_reject {
+                tracing::warn!("blocked outbound spam from {} [{}]", user.email, v.reasons.join(" "));
+                return Ok("550 5.7.1 Message rejected as spam".into());
+            }
+            if let Some(t) = v.tempfail {
+                return Ok(format!("451 4.7.1 {t}, try again later"));
+            }
         }
         let uid = user.id;
         let settings = self.srv.store.call(move |c| crate::prefs::load(c, uid)).await?;
@@ -548,6 +648,10 @@ fn strip_forged_auth_results(data: &[u8], host: &str) -> Vec<u8> {
                 if v.trim_start().starts_with(&host.to_ascii_lowercase()) {
                     skipping = true;
                 }
+            }
+            // Senders must not be able to pre-label their own mail as clean.
+            if lower.starts_with("x-spam-") {
+                skipping = true;
             }
         }
         if !skipping {

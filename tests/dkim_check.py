@@ -1,6 +1,6 @@
 """Verify Postwright's DKIM signatures with dkimpy, using the public key from `domain dns`."""
 import dkim, imaplib, ssl, subprocess, sys, re
-out = subprocess.run(["/home/claude/postwright/target/debug/postwright", "-c", "/tmp/pwtest/postwright.toml", "domain", "dns", "poffles.test"], capture_output=True, text=True).stdout
+out = subprocess.run(["/home/claude/postwright-repo/target/release/postwright", "-c", "/tmp/pwtest/postwright.toml", "domain", "dns", "poffles.test"], capture_output=True, text=True).stdout
 txt = out.strip().splitlines()[-1].encode()
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 m = imaplib.IMAP4_SSL("127.0.0.1", 1993, ssl_context=ctx); m.login("tony@johncock.test", "CorrectHorse1"); m.select("INBOX")

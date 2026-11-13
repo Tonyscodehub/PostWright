@@ -11,6 +11,8 @@ One binary provides:
 - **Out-of-office auto-replies** and **server-stored signatures**
 - **A settings web page and JSON API**, plus Thunderbird-style **autoconfig**
 - An **outbound queue** with MX failover, retries with back-off, and bounce reports
+- **Antispam and antivirus filtering**: built-in checks, plus ClamAV, Rspamd, and SpamAssassin plugins
+- **One-command migration from iRedMail**, keeping passwords, DKIM keys, mail, and calendars
 
 It works with Mailwright, Thunderbird, Apple Mail and Calendar, Outlook (IMAP), iOS, Android (K-9, FairEmail, DAVx5), and anything else that speaks the standards.
 
@@ -88,6 +90,80 @@ relay_username = "..."
 relay_password = "..."
 ```
 
+## Antispam and antivirus
+
+Filtering happens inside the SMTP conversation, so spam and malware are refused before Postwright accepts responsibility for them. That means no backscatter and no bounces to forged senders.
+
+**Built in** (pure Rust, always available):
+
+- DNS blocklists (Spamhaus ZEN and SpamCop by default)
+- Pre-greeting "early talker" detection: spambots talk before the banner
+- Forward-confirmed reverse DNS
+- HELO sanity checks
+- Scoring of SPF, DKIM, and DMARC results
+
+Senders' own `X-Spam-*` and forged `Authentication-Results` headers are stripped.
+
+**Plugins**: add a section to enable each one.
+
+```toml
+[filter]
+junk_score = 5.0      # delivered to the Junk folder at or above this
+reject_score = 12.0   # refused at or above this
+
+[filter.clamav]
+address = "unix:/run/clamav/clamd.ctl"    # or "127.0.0.1:3310"
+on_fail = "tempfail"                     # scanner down: defer mail rather than let it through
+
+[filter.rspamd]
+url = "http://127.0.0.1:11333"
+password = "..."                          # controller password, for learning
+
+[filter.spamassassin]
+address = "127.0.0.1:783"
+learn = true                              # needs spamd --allow-tell
+```
+
+- **Viruses** are refused, both inbound and from your own users.
+- **Spam** scoring combines the built-in checks with the plugins' scores. Rspamd's `reject` action is honoured, and so is its greylisting, for inbound mail only.
+- **Learning:** when a user moves a message into Junk, Rspamd and SpamAssassin learn it as spam. Moving it back out of Junk teaches them it's ham.
+- **Outbound mail** is scanned for malware and for spam an engine says to reject (a compromised account), but a user's own mail is never junk-filed.
+
+Spamhaus refuses queries arriving via large public resolvers such as Cloudflare or Google. Point the server at your own recursive resolver (Unbound on OPNsense works), or use a Spamhaus DQS zone.
+
+## Migrating from iRedMail
+
+Run the importer **on the iRedMail server, as root**. It uses the credentials iRedMail already configured, so nothing needs opening up. The Linux release is a static binary and runs on Rocky, Alma, RHEL, Debian, or Ubuntu.
+
+```sh
+postwright init --hostname mail.example.com --data-dir /var/lib/postwright
+postwright import iredmail --dry-run     # shows the detected backend and what it found
+postwright import iredmail               # do it
+```
+
+**What it does:**
+
+- **Detects the backend** (MariaDB/MySQL, PostgreSQL, or OpenLDAP) from Postfix's configuration.
+- **Domains and alias domains:** imported with their **existing DKIM keys and selectors** (from amavisd). DNS needs no changes.
+- **Users:** keep their **current passwords**. iRedMail's SSHA512, BCRYPT, SHA512-CRYPT, and other hashes are verified once and then silently upgraded to Argon2id.
+- **Aliases, forwarding, and alias accounts:** imported, including "forward and keep a copy" versus "forward only".
+- **Mail:** every Maildir folder, with read, flagged, answered, and draft flags, Dovecot keywords, and received dates. **Dovecot's IMAP UIDs and UIDVALIDITY are preserved**, so mail apps don't re-download everything after cutover.
+- **SOGo calendars, and who they're shared with**, become Postwright calendars and shares.
+
+It's safe to run repeatedly: anything already imported is skipped.
+
+**Cutover plan:**
+
+1. Do a bulk import while iRedMail is still live.
+2. Check it, with Postwright on other ports or another machine.
+3. At cutover, stop Postfix and Dovecot, run the import once more to catch the last few minutes, and start Postwright on the standard ports.
+
+Not imported:
+
+- SOGo contacts (no CardDAV yet)
+- mlmmj list archives (list members do become aliases)
+- Sieve filter rules
+
 ## Out of office
 
 Replies follow RFC 3834:
@@ -138,7 +214,8 @@ All endpoints use HTTP Basic auth (email and password) over HTTPS. State-changin
 ## Administration
 
 ```text
-postwright domain   add | list | remove | dns | catch-all
+postwright domain   add | alias | list | remove | dns | catch-all
+postwright import   iredmail
 postwright user     add | passwd | list | remove | disable | enable | vacation | signature
 postwright alias    add | remove | list
 postwright calendar list | create | share | unshare
@@ -168,14 +245,13 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 
 ## Deployment
 
-- **Linux:** see `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
+- **Linux:** the release binary is fully static (musl), so it runs on any x86-64 distribution. See `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
 - **Windows:** `postwright.exe serve` runs as-is. Use NSSM or `sc.exe` to run it as a service.
 
 ## Not yet included
 
 - CardDAV contacts
 - Server-side filtering rules (Sieve)
-- Content spam scoring (SPF, DKIM, and DMARC checks are in)
 - POP3
 - IMAP CONDSTORE/QRESYNC
 - JMAP
@@ -184,6 +260,8 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 
 ```sh
 cargo build --release
+# Static Linux binary (runs on any distribution):
+rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl
 # Windows from Linux:
 rustup target add x86_64-pc-windows-gnu && cargo build --release --target x86_64-pc-windows-gnu
 ```

@@ -29,7 +29,7 @@ def inbox(who, search="ALL"):
     m.logout(); return out
 
 def queue():
-    return subprocess.run(["/home/claude/postwright/target/debug/postwright", "-c", "/tmp/pwtest/postwright.toml", "queue", "list"], capture_output=True, text=True).stdout
+    return subprocess.run(["/home/claude/postwright-repo/target/release/postwright", "-c", "/tmp/pwtest/postwright.toml", "queue", "list"], capture_output=True, text=True).stdout
 
 # --- Settings page / API / autoconfig
 s, h, _ = req("GET", "/", who=None)

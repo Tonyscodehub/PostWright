@@ -1,16 +1,25 @@
 #!/bin/sh
-# Fresh database, then each suite against a freshly started server (the IP block is in-memory).
-B=/home/claude/postwright/target/${PROFILE:-debug}/postwright
-cd /tmp/pwtest
-start() { pkill -f "postwright serve"; sleep 1; (RUST_LOG=info $B serve >> server.log 2>&1 &); sleep 1.5; }
-pkill -f "postwright serve"; sleep 1
-rm -f data/postwright.db data/postwright.db-wal data/postwright.db-shm server.log
-$B domain add johncock.test >/dev/null; $B domain add poffles.test >/dev/null
-$B user add tony@johncock.test --password 'CorrectHorse1' --quota-mb 100 >/dev/null
-$B user add amy@poffles.test --password 'BatteryStaple2' >/dev/null
-$B alias add hello@poffles.test amy@poffles.test >/dev/null
-$B alias add info@poffles.test tony@johncock.test >/dev/null
-$B domain catch-all poffles.test amy@poffles.test >/dev/null
-start; timeout 150 python3 -I /home/claude/tests/e2e.py | grep -E "FAIL|passed"
-start; python3 -I /home/claude/tests/dkim_check.py
-start; timeout 150 python3 -I /home/claude/tests/e2e_features.py | grep -E "FAIL|passed"
+# Runs every suite against a freshly started server (the brute-force IP block is in-memory,
+# and one suite deliberately triggers it). PROFILE selects the build, e.g. "release" or
+# "x86_64-unknown-linux-musl/release".
+B=/home/claude/postwright-repo/target/${PROFILE:-release}/postwright
+T=/home/claude/tests
+stop() { pkill -f "postwright.* serve"; sleep 1; }
+start() { stop; (RUST_LOG=info $B -c "/tmp/pwtest/$1" serve >> /tmp/pwtest/server.log 2>&1 &); sleep 1.5; }
+
+stop
+cd /tmp/pwtest && rm -f data/postwright.db data/postwright.db-wal data/postwright.db-shm server.log
+C="-c /tmp/pwtest/postwright.toml"
+$B $C domain add johncock.test >/dev/null; $B $C domain add poffles.test >/dev/null
+$B $C user add tony@johncock.test --password 'CorrectHorse1' --quota-mb 100 >/dev/null
+$B $C user add amy@poffles.test --password 'BatteryStaple2' >/dev/null
+$B $C alias add hello@poffles.test amy@poffles.test >/dev/null
+$B $C alias add info@poffles.test tony@johncock.test >/dev/null
+$B $C domain catch-all poffles.test amy@poffles.test >/dev/null
+
+start postwright.toml; echo "core:";     timeout 150 python3 -I $T/e2e.py | grep -E "FAIL|passed"
+start postwright.toml; echo "dkim:";     python3 -I $T/dkim_check.py
+start postwright.toml; echo "features:"; timeout 150 python3 -I $T/e2e_features.py | grep -E "FAIL|passed"
+# Scanner suite: real ClamAV, Rspamd and SpamAssassin must be running.
+start filter.toml;     echo "filters:";  timeout 150 python3 -I $T/filter_check.py | grep -E "FAIL|passed"
+stop

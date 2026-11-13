@@ -20,9 +20,67 @@ pub fn hash_password(pw: &str) -> Result<String> {
 }
 
 fn verify_hash(pw: &str, hash: &str) -> bool {
-    match PasswordHash::new(hash) {
-        Ok(h) => Argon2::default().verify_password(pw.as_bytes(), &h).is_ok(),
-        Err(_) => false,
+    if hash.starts_with("$argon2") {
+        return match PasswordHash::new(hash) {
+            Ok(h) => Argon2::default().verify_password(pw.as_bytes(), &h).is_ok(),
+            Err(_) => false,
+        };
+    }
+    verify_legacy(pw, hash)
+}
+
+pub fn is_legacy(hash: &str) -> bool {
+    !hash.starts_with("$argon2")
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Salted digest: base64(digest(pw + salt) + salt), as used by Dovecot/iRedMail {SSHA*}.
+fn ssha<D: sha2::Digest>(pw: &str, b64: &str) -> bool {
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else { return false };
+    let n = <D as sha2::Digest>::output_size();
+    if raw.len() <= n {
+        return false;
+    }
+    let (digest, salt) = raw.split_at(n);
+    let mut h = D::new();
+    h.update(pw.as_bytes());
+    h.update(salt);
+    ct_eq(&h.finalize(), digest)
+}
+
+fn plain_digest<D: sha2::Digest>(pw: &str, enc: &str) -> bool {
+    let d = D::digest(pw.as_bytes());
+    let e = enc.trim();
+    ct_eq(base64::engine::general_purpose::STANDARD.encode(&d).as_bytes(), e.as_bytes())
+        || ct_eq(hex::encode(&d).as_bytes(), e.to_ascii_lowercase().as_bytes())
+}
+
+/// Password schemes found in iRedMail/Dovecot/Postfixadmin databases. Verified once, then
+/// replaced with Argon2id by the caller.
+pub fn verify_legacy(pw: &str, hash: &str) -> bool {
+    let hash = hash.trim();
+    let (scheme, rest) = match hash.strip_prefix('{').and_then(|h| h.split_once('}')) {
+        Some((s, r)) => (s.to_ascii_uppercase(), r),
+        None => (String::new(), hash),
+    };
+    match scheme.as_str() {
+        "SSHA512" => ssha::<sha2::Sha512>(pw, rest),
+        "SSHA256" => ssha::<sha2::Sha256>(pw, rest),
+        "SSHA" => ssha::<sha1::Sha1>(pw, rest),
+        "SHA512" => plain_digest::<sha2::Sha512>(pw, rest),
+        "SHA256" => plain_digest::<sha2::Sha256>(pw, rest),
+        "SHA" | "SHA1" => plain_digest::<sha1::Sha1>(pw, rest),
+        "PLAIN-MD5" | "MD5" | "LDAP-MD5" => plain_digest::<md5::Md5>(pw, rest),
+        "SMD5" => ssha::<md5::Md5>(pw, rest),
+        "PLAIN" | "CLEARTEXT" | "CLEAR" => ct_eq(pw.as_bytes(), rest.as_bytes()),
+        // {CRYPT}, {BLF-CRYPT}, {SHA512-CRYPT}, {MD5-CRYPT} or a bare crypt(3) string.
+        "" | "CRYPT" | "BLF-CRYPT" | "SHA512-CRYPT" | "SHA256-CRYPT" | "MD5-CRYPT" => {
+            rest.starts_with('$') && pwhash::unix::verify(pw, rest)
+        }
+        _ => false,
     }
 }
 
@@ -54,6 +112,16 @@ pub async fn authenticate(store: &Store, email: &str, password: &str) -> Result<
                 _ => (dummy.clone(), None),
             };
             let ok = verify_hash(&pw, &hash);
+            if ok {
+                if let Some(u) = &user {
+                    if is_legacy(&u.password) {
+                        // Transparent upgrade of imported hashes to Argon2id.
+                        let new = hash_password(&pw)?;
+                        store::set_password(c, &u.email, &new)?;
+                        tracing::info!("upgraded password hash for {} to Argon2id", u.email);
+                    }
+                }
+            }
             Ok(if ok { user } else { None })
         })
         .await
@@ -169,5 +237,35 @@ impl Guard {
 
     pub fn record_success(&self, ip: IpAddr) {
         self.inner.lock().unwrap().failures.remove(&ip);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_hashes() {
+        // Generated with: doveadm pw -s SSHA512 -p secret123 (format reproduced here).
+        use sha2::Digest;
+        let salt = b"abcdefgh";
+        let mut h = sha2::Sha512::new();
+        h.update(b"secret123");
+        h.update(salt);
+        let mut raw = h.finalize().to_vec();
+        raw.extend_from_slice(salt);
+        let ssha512 = format!("{{SSHA512}}{}", base64::engine::general_purpose::STANDARD.encode(raw));
+        assert!(verify_legacy("secret123", &ssha512));
+        assert!(!verify_legacy("wrong", &ssha512));
+        let bcrypt = pwhash::bcrypt::hash("secret123").unwrap();
+        assert!(verify_legacy("secret123", &format!("{{CRYPT}}{bcrypt}")));
+        assert!(verify_legacy("secret123", &format!("{{BLF-CRYPT}}{bcrypt}")));
+        let sha512c = pwhash::sha512_crypt::hash("secret123").unwrap();
+        assert!(verify_legacy("secret123", &format!("{{CRYPT}}{sha512c}")));
+        assert!(verify_legacy("secret123", &sha512c));
+        let md5hex = hex::encode(<md5::Md5 as sha2::Digest>::digest(b"secret123"));
+        assert!(verify_legacy("secret123", &format!("{{PLAIN-MD5}}{md5hex}")));
+        assert!(!verify_legacy("x", "{UNKNOWN}abc"));
+        assert!(!verify_legacy("x", ""));
     }
 }

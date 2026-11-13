@@ -54,14 +54,28 @@ pub fn resolve(c: &Connection, addr: &str, depth: u8, out: &mut Resolved) -> Res
         }
         return Ok(());
     };
-    let before = out.users.len() + out.external.len();
-    if let Some(u) = store::find_user(c, &addr)? {
-        if u.enabled && !out.users.contains(&u.id) {
-            out.users.push(u.id);
-        }
+    if let Some(target) = &dom.alias_of {
+        return resolve(c, &format!("{local}@{target}"), depth + 1, out);
     }
-    for t in store::alias_targets(c, &addr)? {
-        resolve(c, &t, depth + 1, out)?;
+    let before = out.users.len() + out.external.len();
+    let user = store::find_user(c, &addr)?;
+    let targets = store::alias_targets(c, &addr)?;
+    let push_user = |out: &mut Resolved| {
+        if let Some(u) = &user {
+            if u.enabled && !out.users.contains(&u.id) {
+                out.users.push(u.id);
+            }
+        }
+    };
+    // A user with forwarding rules gets a local copy only if one of the targets is
+    // themselves ("keep a copy"); otherwise the mail is forwarded only.
+    if user.is_none() || targets.is_empty() || targets.contains(&addr) {
+        push_user(out);
+    }
+    for t in targets {
+        if t != addr {
+            resolve(c, &t, depth + 1, out)?;
+        }
     }
     if out.users.len() + out.external.len() == before {
         if let Some((base, _tag)) = local.split_once('+') {
@@ -109,6 +123,11 @@ pub fn check_local_rcpt(c: &Connection, addr: &str, size_hint: i64) -> Result<Rc
 /// Deliver a finished message to every recipient: local users go straight into INBOX,
 /// everything else is queued per destination domain. Returns recipients that failed.
 pub async fn deliver(srv: &Shared, mail_from: &str, rcpts: &[String], data: Vec<u8>) -> Result<Vec<String>> {
+    deliver_to(srv, mail_from, rcpts, data, false).await
+}
+
+/// As `deliver`, optionally filing local copies in the Junk folder.
+pub async fn deliver_to(srv: &Shared, mail_from: &str, rcpts: &[String], data: Vec<u8>, junk: bool) -> Result<Vec<String>> {
     let size = data.len() as i64;
     let headers = data[..find_header_end(&data)].to_vec();
     let blob = srv.store.put_blob(Arc::new(data)).await?;
@@ -137,7 +156,11 @@ pub async fn deliver(srv: &Shared, mail_from: &str, rcpts: &[String], data: Vec<
                         failed.push(r.clone());
                         continue;
                     }
-                    let inbox = store::find_mailbox(c, uid, "INBOX")?.ok_or_else(|| anyhow!("INBOX missing"))?;
+                    let junk_box = if junk { store::find_mailbox(c, uid, "Junk")? } else { None };
+                    let inbox = match junk_box {
+                        Some(j) => j,
+                        None => store::find_mailbox(c, uid, "INBOX")?.ok_or_else(|| anyhow!("INBOX missing"))?,
+                    };
                     store::append_message(c, inbox.id, &blob, size, now(), &[])?;
                     touched.push(uid);
                     replies.push((uid, r.clone()));
@@ -159,7 +182,7 @@ pub async fn deliver(srv: &Shared, mail_from: &str, rcpts: &[String], data: Vec<
     for u in touched {
         srv.notify_user(u);
     }
-    if !mail_from.is_empty() {
+    if !mail_from.is_empty() && !junk {
         for (uid, rcpt) in replies {
             let fut = crate::prefs::vacation_reply(srv.clone(), uid, rcpt, mail_from.to_string(), headers.clone());
             tokio::spawn(async move {

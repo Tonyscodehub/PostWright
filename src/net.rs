@@ -164,6 +164,18 @@ impl Conn {
         self.write(&v).await
     }
 
+    /// Wait up to `dur` before the banner; returns true if the client spoke first.
+    pub async fn early_talk(&mut self, dur: Duration) -> bool {
+        let mut tmp = [0u8; 1024];
+        match tokio::time::timeout(dur, self.stream.read(&mut tmp)).await {
+            Ok(Ok(n)) if n > 0 => {
+                self.buf.extend_from_slice(&tmp[..n]);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn has_buffered(&self) -> bool {
         !self.buf.is_empty()
     }

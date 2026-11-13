@@ -18,6 +18,7 @@ pub struct Config {
     pub submission: SubmissionPolicy,
     pub queue: QueueConfig,
     pub security: SecurityConfig,
+    pub filter: crate::filter::FilterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +121,7 @@ impl Default for Config {
             submission: SubmissionPolicy::default(),
             queue: QueueConfig::default(),
             security: SecurityConfig::default(),
+            filter: crate::filter::FilterConfig::default(),
         }
     }
 }

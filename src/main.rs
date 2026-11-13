@@ -4,8 +4,10 @@ mod auth;
 mod caldav;
 mod config;
 mod delivery;
+mod filter;
 mod http;
 mod imap;
+mod iredmail;
 mod net;
 mod prefs;
 mod server;
@@ -61,6 +63,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CalendarCmd,
     },
+    /// Migrate from another mail server.
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
+    },
     /// Inspect the outbound queue.
     Queue {
         #[command(subcommand)]
@@ -69,13 +76,45 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum ImportCmd {
+    /// Import everything from an iRedMail server. Run on that server as root.
+    Iredmail {
+        /// Account backend: mysql, pgsql or ldap (auto-detected from Postfix if omitted).
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long, default_value = "/etc/postfix")]
+        postfix_dir: PathBuf,
+        /// Show what would be imported without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Accounts only; don't copy mail.
+        #[arg(long)]
+        no_mail: bool,
+        /// Skip SOGo calendars.
+        #[arg(long)]
+        no_calendars: bool,
+        /// Import a single user (e.g. for a trial run).
+        #[arg(long)]
+        user: Option<String>,
+        /// Custom SQL client command for non-standard setups.
+        #[arg(long)]
+        sql_cmd: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DomainCmd {
-    /// Host a new domain and generate its DKIM key.
+    /// Host a new domain. Generates a DKIM key unless --dkim-key is given.
     Add {
         name: String,
         #[arg(long, default_value = "pw1")]
         selector: String,
+        /// Use an existing DKIM private key (PEM, PKCS#1 or PKCS#8) so DNS doesn't change.
+        #[arg(long)]
+        dkim_key: Option<PathBuf>,
     },
+    /// Make ALIAS an alias domain of TARGET (local@ALIAS is delivered to local@TARGET).
+    Alias { alias: String, target: String },
     List,
     Remove { name: String },
     /// Print the DNS records the domain needs.
@@ -181,6 +220,13 @@ fn main() -> Result<()> {
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
         Cmd::Queue { cmd } => queue_cmd(&cfg, cmd),
         Cmd::Calendar { cmd } => calendar_cmd(&cfg, cmd),
+        Cmd::Import { cmd: ImportCmd::Iredmail { backend, postfix_dir, dry_run, no_mail, no_calendars, user, sql_cmd } } => {
+            let st = open_store(&cfg)?;
+            iredmail::run(
+                &st,
+                &iredmail::Opts { backend, postfix_dir, dry_run, mail: !no_mail, calendars: !no_calendars, only_user: user, sql_cmd },
+            )
+        }
         Cmd::Init { .. } => unreachable!(),
     }
 }
@@ -247,13 +293,22 @@ fn read_password(given: Option<String>) -> Result<String> {
 fn domain_cmd(cfg: &Config, cmd: DomainCmd) -> Result<()> {
     let st = open_store(cfg)?;
     match cmd {
-        DomainCmd::Add { name, selector } => {
+        DomainCmd::Alias { alias, target } => {
+            st.sync(|c| store::add_alias_domain(c, &alias, &target, None))?;
+            println!("{alias} is now an alias of {target}");
+        }
+        DomainCmd::Add { name, selector, dkim_key } => {
             let name = name.to_ascii_lowercase();
             if !name.contains('.') {
                 bail!("'{name}' does not look like a domain");
             }
-            println!("Generating 2048-bit RSA DKIM key...");
-            let (pem, _) = delivery::generate_dkim_key()?;
+            let pem = match dkim_key {
+                Some(p) => iredmail::load_rsa_pem(&p).ok_or_else(|| anyhow!("{} is not an RSA private key", p.display()))?,
+                None => {
+                    println!("Generating 2048-bit RSA DKIM key...");
+                    delivery::generate_dkim_key()?.0
+                }
+            };
             st.sync(|c| store::add_domain(c, &name, &selector, &pem))?;
             println!("Added {name}.\n");
             print_dns(cfg, &st, &name)?;
@@ -261,7 +316,10 @@ fn domain_cmd(cfg: &Config, cmd: DomainCmd) -> Result<()> {
         DomainCmd::List => {
             for d in st.sync(|c| store::list_domains(c))? {
                 let ca = d.catch_all.map(|c| format!("  catch-all -> {c}")).unwrap_or_default();
-                println!("{}  (DKIM selector {}){ca}", d.name, d.dkim_selector.unwrap_or_default());
+                match d.alias_of {
+                    Some(t) => println!("{}  (alias of {t})", d.name),
+                    None => println!("{}  (DKIM selector {}){ca}", d.name, d.dkim_selector.unwrap_or_default()),
+                }
             }
         }
         DomainCmd::Remove { name } => {
