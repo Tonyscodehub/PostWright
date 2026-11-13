@@ -16,6 +16,7 @@ enum Page {
     Overview,
     Domains,
     Users,
+    Access,
     Aliases,
     Queue,
     Filters,
@@ -28,6 +29,7 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Overview, "Overview"),
     (Page::Domains, "Domains"),
     (Page::Users, "Users"),
+    (Page::Access, "Mailbox access"),
     (Page::Aliases, "Aliases"),
     (Page::Queue, "Mail queue"),
     (Page::Filters, "Spam & antivirus"),
@@ -74,6 +76,7 @@ struct EditUser {
     password: String,
     enabled: bool,
     admin: bool,
+    mfa: bool,
 }
 
 struct Confirm {
@@ -87,6 +90,8 @@ struct Confirm {
 struct App {
     saved: Saved,
     password: String,
+    mfa_code: String,
+    need_code: bool,
     login_busy: bool,
     login_error: Option<String>,
     pending_cert: Option<String>,
@@ -101,6 +106,11 @@ struct App {
     overview: Option<Value>,
     domains: Vec<Value>,
     users: Vec<Value>,
+    delegations: Vec<Value>,
+    nd_owner: String,
+    nd_grantee: String,
+    nd_mailbox: String,
+    nd_send: String,
     aliases: Vec<Value>,
     queue: Vec<Value>,
     filters: Option<Value>,
@@ -149,6 +159,13 @@ impl App {
         Self {
             saved: load_saved(),
             password: String::new(),
+            mfa_code: String::new(),
+            need_code: false,
+            delegations: vec![],
+            nd_owner: String::new(),
+            nd_grantee: String::new(),
+            nd_mailbox: "full".into(),
+            nd_send: "on_behalf".into(),
             login_busy: false,
             login_error: None,
             pending_cert: None,
@@ -206,11 +223,12 @@ impl App {
         self.login_busy = true;
         self.login_error = None;
         let (server, email, pw) = (self.saved.server.clone(), self.saved.email.clone(), self.password.clone());
+        let code = if self.need_code { Some(self.mfa_code.trim().to_string()) } else { None };
         let pin = self.saved.pins.get(&api::normalise_url(&server)).cloned();
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let msg = match Client::connect(&server, &email, &pw, pin) {
+            let msg = match Client::connect(&server, &email, &pw, code.as_deref(), pin) {
                 Ok((c, v, p)) => Msg::LoggedIn(c, v, p),
                 Err(e) => Msg::LoginFailed(e),
             };
@@ -235,6 +253,7 @@ impl App {
             Page::Overview => "overview".to_string(),
             Page::Domains => "domains".into(),
             Page::Users => "users".into(),
+            Page::Access => "delegations".into(),
             Page::Aliases => "aliases".into(),
             Page::Queue => "queue".into(),
             Page::Filters => "filters".into(),
@@ -247,6 +266,10 @@ impl App {
             // The add-user form needs the domain list.
             self.spawn(ctx, |c| Msg::Loaded(Page::Domains, c.get("domains")));
         }
+        if page == Page::Access {
+            // The grant form needs the user list.
+            self.spawn(ctx, |c| Msg::Loaded(Page::Users, c.get("users")));
+        }
     }
 
     fn action(&mut self, ctx: &egui::Context, method: &'static str, path: String, body: Value, page: Page, ok: &str) {
@@ -255,6 +278,16 @@ impl App {
             let r = if method == "DELETE" { c.delete(&path) } else { c.send(method, &path, &body) };
             Msg::Done(page, ok, r)
         });
+    }
+
+    fn error(&mut self, e: String) {
+        if e.starts_with("Your session has ended") {
+            self.client = None;
+            self.overview = None;
+            self.login_error = Some(e);
+        } else {
+            self.toast(e, false);
+        }
     }
 
     fn toast(&mut self, text: impl Into<String>, ok: bool) {
@@ -270,6 +303,8 @@ impl App {
                     self.toast("The server now has a publicly trusted certificate", true);
                 }
                 self.password.clear();
+                self.mfa_code.clear();
+                self.need_code = false;
                 self.client = Some(c);
                 self.overview = Some(v);
                 self.page = Page::Overview;
@@ -285,9 +320,20 @@ impl App {
                 self.cert_changed = true;
                 self.pending_cert = Some(fp);
             }
+            Msg::LoginFailed(ConnectError::NeedCode) => {
+                self.login_busy = false;
+                if self.need_code {
+                    self.login_error = Some("That code isn't right, or it has already been used.".into());
+                    self.mfa_code.clear();
+                }
+                self.need_code = true;
+            }
             Msg::LoginFailed(ConnectError::Other(e)) => {
                 self.login_busy = false;
                 self.login_error = Some(e);
+                if self.need_code {
+                    self.mfa_code.clear();
+                }
             }
             Msg::Loaded(page, r) => {
                 self.busy = self.busy.saturating_sub(1);
@@ -298,6 +344,7 @@ impl App {
                             Page::Overview => self.overview = Some(v.clone()),
                             Page::Domains => self.domains = arr(),
                             Page::Users => self.users = arr(),
+                            Page::Access => self.delegations = arr(),
                             Page::Aliases => self.aliases = arr(),
                             Page::Queue => self.queue = arr(),
                             Page::Filters => self.filters = Some(v.clone()),
@@ -308,7 +355,7 @@ impl App {
                             }
                         }
                     }
-                    Err(e) => self.toast(e, false),
+                    Err(e) => self.error(e),
                 }
             }
             Msg::Done(page, ok, r) => {
@@ -321,7 +368,7 @@ impl App {
                             self.dns.clear();
                         }
                     }
-                    Err(e) => self.toast(e, false),
+                    Err(e) => self.error(e),
                 }
             }
             Msg::Dns(d, r) => {
@@ -352,9 +399,21 @@ impl App {
                     ui.label("Password");
                     let pw = ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(260.0));
                     ui.end_row();
-                    let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if self.need_code {
+                        ui.label("Code");
+                        let c = ui.add(egui::TextEdit::singleline(&mut self.mfa_code).hint_text("from your authenticator app").desired_width(260.0));
+                        if !c.has_focus() && self.mfa_code.is_empty() && !self.login_busy {
+                            c.request_focus();
+                        }
+                        ui.end_row();
+                        enter = c.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    }
                     ui.label("");
-                    let ready = !self.saved.server.trim().is_empty() && !self.saved.email.trim().is_empty() && !self.password.is_empty();
+                    let ready = !self.saved.server.trim().is_empty()
+                        && !self.saved.email.trim().is_empty()
+                        && !self.password.is_empty()
+                        && (!self.need_code || !self.mfa_code.trim().is_empty());
                     ui.horizontal(|ui| {
                         let b = ui.add_enabled(ready && !self.login_busy, egui::Button::new(RichText::new("Sign in").strong()));
                         if self.login_busy {
@@ -366,6 +425,10 @@ impl App {
                     });
                     ui.end_row();
                 });
+                if self.need_code {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("This account uses two-step verification. Enter the 6-digit code from your authenticator app, or one of your recovery codes.").small());
+                }
                 if let Some(e) = &self.login_error {
                     ui.add_space(8.0);
                     ui.colored_label(Color32::from_rgb(0xc0, 0x39, 0x2b), e);
@@ -710,6 +773,9 @@ impl App {
                             if u["legacy_password"].as_bool().unwrap_or(false) {
                                 pill(ui, "Imported password", Tone::Info);
                             }
+                            if u["mfa"].as_bool().unwrap_or(false) {
+                                pill(ui, "2-step on", Tone::Good);
+                            }
                         });
                     });
                     if ui.button("Edit").clicked() {
@@ -719,6 +785,7 @@ impl App {
                             password: String::new(),
                             enabled: u["enabled"].as_bool().unwrap_or(true),
                             admin: u["admin"].as_bool().unwrap_or(false),
+                            mfa: u["mfa"].as_bool().unwrap_or(false),
                         });
                     }
                     if ui.button(RichText::new("Delete").color(bad())).clicked() {
@@ -799,12 +866,131 @@ impl App {
                             keep = false;
                         }
                     });
+                    if e.mfa {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label("Two-step verification is on.");
+                        if ui.button(RichText::new("Reset two-step verification").color(bad())).on_hover_text("For someone who has lost their phone and recovery codes").clicked() {
+                            self.confirm = Some(Confirm {
+                                text: format!("Turn off two-step verification for {}? They'll be signed out everywhere and their app passwords removed, so they can set it up again.", e.email),
+                                method: "POST",
+                                path: format!("users/{}/mfa-reset", seg(&e.email)),
+                                page: Page::Users,
+                                ok: "Two-step verification reset".into(),
+                            });
+                            keep = false;
+                        }
+                    }
                 },
             );
             if keep {
                 self.edit_user = Some(e);
             }
         }
+    }
+
+    fn access_view(&mut self, ui: &mut egui::Ui) {
+        const ACCESS: [(&str, &str); 3] = [("none", "No mailbox access"), ("read", "Read only"), ("full", "Full access")];
+        const SEND: [(&str, &str); 3] = [("none", "Can't send"), ("on_behalf", "Send on behalf"), ("as", "Send as")];
+        let label = |opts: &[(&str, &str); 3], k: &str| opts.iter().find(|(v, _)| *v == k).map(|(_, l)| l.to_string()).unwrap_or_default();
+        self.header(
+            ui,
+            "Mailbox access",
+            "Let someone open another person's mailbox, or send from their address. Shared mailboxes appear in their mail app under \"Other Users\". Opening someone else's mailbox is logged.",
+        );
+        let ctx = ui.ctx().clone();
+        let dels = self.delegations.clone();
+        card(ui, "", |ui| {
+            let w = ui.available_width();
+            let cols = [w * 0.27, w * 0.27, w * 0.18, w * 0.16];
+            ui.horizontal(|ui| {
+                for (h, cw) in ["Mailbox", "Who", "Mailbox access", "Sending"].iter().zip(cols) {
+                    cell(ui, cw, |ui| ui.label(RichText::new(*h).small().strong()));
+                }
+            });
+            ui.separator();
+            if dels.is_empty() {
+                ui.label(RichText::new("Nobody has access to anyone else's mailbox.").color(ui.visuals().weak_text_color()));
+            }
+            for (i, d) in dels.iter().enumerate() {
+                let (owner, grantee) = (s(&d["owner"]), s(&d["grantee"]));
+                let (mut m, mut snd) = (s(&d["mailbox"]), s(&d["send"]));
+                let (m0, s0) = (m.clone(), snd.clone());
+                ui.horizontal(|ui| {
+                    cell(ui, cols[0], |ui| ui.label(RichText::new(&owner).strong()));
+                    cell(ui, cols[1], |ui| ui.label(&grantee));
+                    cell(ui, cols[2], |ui| {
+                        egui::ComboBox::from_id_salt(("dm", i)).selected_text(label(&ACCESS, &m)).show_ui(ui, |ui| {
+                            for (k, l) in ACCESS {
+                                ui.selectable_value(&mut m, k.to_string(), l);
+                            }
+                        })
+                    });
+                    cell(ui, cols[3], |ui| {
+                        egui::ComboBox::from_id_salt(("ds", i)).selected_text(label(&SEND, &snd)).show_ui(ui, |ui| {
+                            for (k, l) in SEND {
+                                ui.selectable_value(&mut snd, k.to_string(), l);
+                            }
+                        })
+                    });
+                    if ui.button(RichText::new("Remove").color(bad())).clicked() {
+                        self.action(&ctx, "DELETE", format!("delegations?owner={}&grantee={}", seg(&owner), seg(&grantee)), Value::Null, Page::Access, "Access removed");
+                    }
+                });
+                if m != m0 || snd != s0 {
+                    let body = json!({"owner": owner, "grantee": grantee, "mailbox": m, "send": snd});
+                    self.action(&ctx, "POST", "delegations".into(), body, Page::Access, "Saved");
+                }
+                ui.separator();
+            }
+        });
+        let emails: Vec<String> = self.users.iter().map(|u| s(&u["email"])).collect();
+        card(ui, "Give access", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("nd_owner")
+                    .selected_text(if self.nd_owner.is_empty() { "Mailbox…".to_string() } else { self.nd_owner.clone() })
+                    .show_ui(ui, |ui| {
+                        for e in &emails {
+                            ui.selectable_value(&mut self.nd_owner, e.clone(), e);
+                        }
+                    });
+                ui.label("to");
+                egui::ComboBox::from_id_salt("nd_grantee")
+                    .selected_text(if self.nd_grantee.is_empty() { "Person…".to_string() } else { self.nd_grantee.clone() })
+                    .show_ui(ui, |ui| {
+                        for e in &emails {
+                            ui.selectable_value(&mut self.nd_grantee, e.clone(), e);
+                        }
+                    });
+                egui::ComboBox::from_id_salt("nd_m").selected_text(label(&ACCESS, &self.nd_mailbox)).show_ui(ui, |ui| {
+                    for (k, l) in ACCESS {
+                        ui.selectable_value(&mut self.nd_mailbox, k.to_string(), l);
+                    }
+                });
+                egui::ComboBox::from_id_salt("nd_s").selected_text(label(&SEND, &self.nd_send)).show_ui(ui, |ui| {
+                    for (k, l) in SEND {
+                        ui.selectable_value(&mut self.nd_send, k.to_string(), l);
+                    }
+                });
+                let ready = !self.nd_owner.is_empty() && !self.nd_grantee.is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Give access")).clicked() {
+                    let body = json!({"owner": self.nd_owner, "grantee": self.nd_grantee, "mailbox": self.nd_mailbox, "send": self.nd_send});
+                    self.action(&ctx, "POST", "delegations".into(), body, Page::Access, "Access given");
+                }
+            });
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Read only: can read and search, but not change or delete anything. Full access: can also file, flag, delete and add mail. \
+                         Send on behalf: recipients see \"Tony on behalf of Amy\". Send as: mail looks exactly as if Amy sent it.",
+                    )
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                )
+                .wrap(),
+            );
+        });
     }
 
     fn aliases_view(&mut self, ui: &mut egui::Ui) {
@@ -1177,7 +1363,11 @@ impl eframe::App for App {
                 ui.label(RichText::new(self.client.as_ref().map(|c| c.base().to_string()).unwrap_or_default()).color(ui.visuals().weak_text_color()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Sign out").clicked() {
-                        self.client = None;
+                        if let Some(c) = self.client.take() {
+                            std::thread::spawn(move || {
+                                let _ = c.logout();
+                            });
+                        }
                         self.overview = None;
                     }
                     ui.label(&self.saved.email);
@@ -1206,6 +1396,7 @@ impl eframe::App for App {
                     Page::Overview => self.overview_view(ui),
                     Page::Domains => self.domains_view(ui),
                     Page::Users => self.users_view(ui),
+                    Page::Access => self.access_view(ui),
                     Page::Aliases => self.aliases_view(ui),
                     Page::Queue => self.queue_view(ui),
                     Page::Filters => self.filters_view(ui),

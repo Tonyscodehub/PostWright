@@ -29,6 +29,8 @@ struct Session {
     helo: Option<String>,
     user: Option<User>,
     sender_addrs: Vec<String>,
+    /// Other people's addresses this user may send from (delegation), with the mode.
+    delegated: Vec<(String, crate::identity::SendRight)>,
     mail_from: Option<String>,
     rcpts: Vec<String>,
     declared_size: i64,
@@ -47,6 +49,7 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr, mode: Mode) -
         helo: None,
         user: None,
         sender_addrs: vec![],
+        delegated: vec![],
         mail_from: None,
         rcpts: vec![],
         declared_size: 0,
@@ -180,7 +183,7 @@ impl Session {
             caps.push("STARTTLS".into());
         }
         if self.auth_available() && self.user.is_none() {
-            caps.push("AUTH PLAIN LOGIN".into());
+            caps.push("AUTH PLAIN LOGIN OAUTHBEARER XOAUTH2".into());
         }
         let n = caps.len();
         for (i, c) in caps.iter().enumerate() {
@@ -246,6 +249,25 @@ impl Session {
                     _ => None,
                 }
             }
+            "OAUTHBEARER" | "XOAUTH2" => {
+                let resp = match initial {
+                    Some(r) if r != "=" => r,
+                    _ => {
+                        self.conn.send("334 ").await?;
+                        String::from_utf8_lossy(&self.conn.read_line().await?).to_string()
+                    }
+                };
+                let user = match auth::decode_bearer(&resp) {
+                    Some((who, token)) => auth::token_login(&self.srv.store, who.as_deref(), &token).await?,
+                    None => None,
+                };
+                if user.is_none() {
+                    // RFC 7628: error challenge, then the client sends ^A (or an empty line).
+                    self.conn.send(&format!("334 {}", auth::BEARER_ERROR_B64)).await?;
+                    let _ = self.conn.read_line().await;
+                }
+                return self.auth_done(user).await;
+            }
             _ => {
                 self.reply("504 5.5.4 Unrecognised authentication mechanism").await?;
                 return Ok(true);
@@ -255,11 +277,22 @@ impl Session {
             Some((u, p)) => auth::authenticate(&self.srv.store, &u, &p).await?,
             None => None,
         };
+        self.auth_done(user).await
+    }
+
+    async fn auth_done(&mut self, user: Option<User>) -> Result<bool> {
+        let ip = self.peer.ip();
         match user {
             Some(u) => {
                 self.srv.guard.record_success(ip);
                 let uu = u.clone();
-                self.sender_addrs = self.srv.store.call(move |c| store::sender_addresses(c, &uu)).await?;
+                let (own, del) = self
+                    .srv
+                    .store
+                    .call(move |c| Ok((store::sender_addresses(c, &uu)?, crate::identity::delegated_senders(c, uu.id)?)))
+                    .await?;
+                self.sender_addrs = own;
+                self.delegated = del;
                 tracing::info!("SMTP AUTH ok for {} from {}", u.email, ip);
                 self.user = Some(u);
                 self.conn.send("235 2.7.0 Authentication successful").await?;
@@ -304,7 +337,7 @@ impl Session {
         }
         if self.mode == Mode::Submission {
             let a = addr.to_ascii_lowercase();
-            if a.is_empty() || !self.sender_addrs.contains(&a) {
+            if a.is_empty() || !(self.sender_addrs.contains(&a) || self.delegated.iter().any(|(d, _)| *d == a)) {
                 return self.reply("553 5.7.1 Sender address not owned by authenticated user").await;
             }
         }
@@ -529,7 +562,7 @@ impl Session {
         Ok("250 2.0.0 OK: queued".into())
     }
 
-    async fn finish_submission(&mut self, body: Vec<u8>) -> Result<String> {
+    async fn finish_submission(&mut self, mut body: Vec<u8>) -> Result<String> {
         let user = self.user.clone().expect("authenticated");
         let mail_from = self.mail_from.clone().unwrap_or_default();
         let parsed = mail_parser::MessageParser::default().parse_headers(&body);
@@ -539,15 +572,30 @@ impl Session {
             .and_then(|a| a.first())
             .and_then(|a| a.address())
             .map(|s| s.to_ascii_lowercase());
+        // Sending as someone else needs a delegation. "On behalf" adds a Sender: header
+        // naming the real author, so recipients see "Tony on behalf of Amy".
+        let delegation = header_from.as_ref().filter(|f| !self.sender_addrs.contains(*f)).and_then(|f| {
+            self.delegated.iter().find(|(d, _)| d == f).map(|(_, r)| *r)
+        });
         if self.srv.cfg.submission.enforce_from_header {
-            match &header_from {
-                Some(f) if self.sender_addrs.contains(f) => {}
-                _ => return Ok("550 5.7.1 From: header must be an address you own".into()),
+            let own = header_from.as_ref().map(|f| self.sender_addrs.contains(f)).unwrap_or(false);
+            if !own && delegation.is_none() {
+                return Ok("550 5.7.1 From: header must be an address you own or have been allowed to send from".into());
             }
         }
         let mut extra = String::new();
+        if delegation == Some(crate::identity::SendRight::OnBehalf) {
+            extra.push_str(&format!("Sender: <{}>\r\n", user.email));
+        }
+        if let Some(r) = delegation {
+            tracing::info!("{} sent {} {}", user.email, if r == crate::identity::SendRight::As { "as" } else { "on behalf of" }, header_from.as_deref().unwrap_or(""));
+        }
         let has_date = parsed.as_ref().map(|m| m.date().is_some()).unwrap_or(false);
         let has_msgid = parsed.as_ref().map(|m| m.message_id().is_some()).unwrap_or(false);
+        drop(parsed);
+        if delegation.is_some() {
+            body = delivery::strip_header(&body, "sender");
+        }
         if !has_date {
             extra.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
         }

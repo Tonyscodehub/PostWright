@@ -1,7 +1,6 @@
 //! Blocking client for the Postwright admin API, with certificate pinning for servers
 //! that use a self-signed certificate.
 
-use base64::Engine;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
@@ -22,6 +21,8 @@ pub enum ConnectError {
     UntrustedCert(String),
     /// A previously trusted self-signed certificate was replaced by another untrusted one.
     CertChanged(String),
+    /// Password accepted; the account has two-step verification and needs a code.
+    NeedCode,
     Other(String),
 }
 
@@ -122,26 +123,58 @@ pub fn normalise_url(s: &str) -> String {
 }
 
 impl Client {
-    /// Sign in. `pinned` is the approved fingerprint for a self-signed server, if any.
-    pub fn connect(server: &str, email: &str, password: &str, pinned: Option<String>) -> Result<(Client, Value, Pin), ConnectError> {
+    /// Sign in. `pinned` is the approved fingerprint for a self-signed server, if any;
+    /// `code` is the authenticator (or recovery) code once the server has asked for one.
+    pub fn connect(server: &str, email: &str, password: &str, code: Option<&str>, pinned: Option<String>) -> Result<(Client, Value, Pin), ConnectError> {
         let base = normalise_url(server);
-        let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{password}", email.trim())));
-        let make = |mode| Client { base: base.clone(), auth: auth.clone(), agent: agent(mode) };
-        if let Some(fp) = &pinned {
-            let c = make(Verify::Pinned(fp.clone()));
+        let try_mode = |mode: Verify| -> Result<(Client, Value), (bool, ConnectError)> {
+            let agent = agent(mode);
+            let device = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "this computer".into());
+            let mut body = serde_json::json!({ "email": email.trim(), "password": password, "kind": "app", "name": format!("Postwright Admin on {device}") });
+            if let Some(c) = code.filter(|c| !c.trim().is_empty()) {
+                body["code"] = Value::String(c.trim().to_string());
+            }
+            let r = agent.post(&format!("{base}/api/v1/login")).set("X-Requested-With", "postwright-admin").send_json(body);
+            let token = match r {
+                Ok(resp) => {
+                    let v: Value = resp.into_json().map_err(|e| (false, ConnectError::Other(format!("bad response: {e}"))))?;
+                    v["token"].as_str().map(String::from).ok_or((false, ConnectError::Other("the server didn't return a token".into())))?
+                }
+                Err(ureq::Error::Status(code, resp)) => {
+                    let v: Value = resp.into_json().unwrap_or(Value::Null);
+                    if v["mfa_required"].as_bool() == Some(true) {
+                        return Err((false, ConnectError::NeedCode));
+                    }
+                    let msg = v["error"].as_str().map(String::from).unwrap_or_else(|| format!("server returned HTTP {code}"));
+                    return Err((false, ConnectError::Other(msg)));
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    let e = t.to_string();
+                    return Err((looks_like_cert_error(&e), ConnectError::Other(e)));
+                }
+            };
+            let c = Client { base: base.clone(), auth: format!("Bearer {token}"), agent };
             match c.get("overview") {
-                Ok(v) => return Ok((c, v, Pin::Keep)),
-                Err(e) if !looks_like_cert_error(&e) => return Err(ConnectError::Other(e)),
-                Err(_) => {} // certificate changed: see below
+                Ok(v) => Ok((c, v)),
+                Err(e) => {
+                    let _ = c.logout();
+                    Err((false, ConnectError::Other(e)))
+                }
+            }
+        };
+        if let Some(fp) = &pinned {
+            match try_mode(Verify::Pinned(fp.clone())) {
+                Ok((c, v)) => return Ok((c, v, Pin::Keep)),
+                Err((false, e)) => return Err(e),
+                Err((true, _)) => {} // certificate changed: see below
             }
         }
-        let c = make(Verify::Public);
-        match c.get("overview") {
-            Ok(v) => Ok((c, v, if pinned.is_some() { Pin::Drop } else { Pin::Keep })),
-            Err(e) if looks_like_cert_error(&e) => {
+        match try_mode(Verify::Public) {
+            Ok((c, v)) => Ok((c, v, if pinned.is_some() { Pin::Drop } else { Pin::Keep })),
+            Err((true, ConnectError::Other(e))) => {
                 // Find out which certificate the server presented so the user can decide.
                 let seen = Arc::new(Mutex::new(None));
-                let _ = agent(Verify::Capture(seen.clone())).get(&format!("{base}/")).call();
+                let _ = agent(Verify::Capture(seen.clone())).get(&format!("{base}/login")).call();
                 let fp = seen.lock().unwrap().clone();
                 match (fp, pinned.is_some()) {
                     (Some(fp), true) => Err(ConnectError::CertChanged(fp)),
@@ -149,8 +182,19 @@ impl Client {
                     (None, _) => Err(ConnectError::Other(e)),
                 }
             }
-            Err(e) => Err(ConnectError::Other(e)),
+            Err((_, e)) => Err(e),
         }
+    }
+
+    /// End the session on the server.
+    pub fn logout(&self) -> Result<(), String> {
+        self.agent
+            .post(&format!("{}/api/v1/logout", self.base))
+            .set("Authorization", &self.auth)
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     fn url(&self, path: &str) -> String {
@@ -164,7 +208,7 @@ impl Client {
                 let body: Value = resp.into_json().unwrap_or(Value::Null);
                 let msg = body.get("error").and_then(|e| e.as_str()).map(String::from);
                 Err(match (code, msg) {
-                    (401, _) => "Wrong email address or password.".into(),
+                    (401, _) => "Your session has ended. Sign in again.".into(),
                     (_, Some(m)) => m,
                     (c, None) => format!("server returned HTTP {c}"),
                 })
@@ -201,4 +245,31 @@ pub fn seg(s: &str) -> String {
     s.bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"-_.~@+".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs against a live test server: PW_TEST_SERVER=127.0.0.1:8443 cargo test -p postwright-admin -- --ignored
+    #[test]
+    #[ignore]
+    fn live_sign_in() {
+        let server = std::env::var("PW_TEST_SERVER").unwrap();
+        let fp = match Client::connect(&server, "tony@johncock.test", "CorrectHorse1", None, None) {
+            Err(ConnectError::UntrustedCert(fp)) => fp,
+            _ => panic!("expected the self-signed certificate to be reported"),
+        };
+        assert!(matches!(Client::connect(&server, "tony@johncock.test", "wrong", None, Some(fp.clone())), Err(ConnectError::Other(_))));
+        let (c, v, _) = Client::connect(&server, "tony@johncock.test", "CorrectHorse1", None, Some(fp.clone())).ok().unwrap();
+        assert_eq!(v["hostname"], "mail.test.local");
+        assert!(c.get("delegations").unwrap().is_array());
+        c.logout().unwrap();
+        assert!(c.get("overview").unwrap_err().starts_with("Your session has ended"));
+        if let Ok(code) = std::env::var("PW_TEST_MFA_USER") {
+            // user:password with two-step verification on
+            let (u, p) = code.split_once(':').unwrap();
+            assert!(matches!(Client::connect(&server, u, p, None, Some(fp)), Err(ConnectError::NeedCode)));
+        }
+    }
 }

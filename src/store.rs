@@ -197,6 +197,7 @@ fn migrate(c: &Connection) -> Result<()> {
         Ok(cols.iter().any(|c| c == col))
     };
     c.execute_batch(crate::certs::SCHEMA)?;
+    c.execute_batch(crate::identity::SCHEMA)?;
     if !has("users", "is_admin")? {
         c.execute_batch("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")?;
     }

@@ -2491,6 +2491,15 @@ dependencies = [
 
 [[package]]
 name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
@@ -4217,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "postwright"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -4225,8 +4234,10 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "data-encoding",
  "hex",
  "hickory-resolver 0.25.2",
+ "hmac 0.12.1",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -4235,6 +4246,7 @@ dependencies = [
  "mail-parser",
  "md-5 0.10.6",
  "pwhash",
+ "qrcode",
  "quick-xml 0.42.0",
  "rand 0.8.8",
  "rcgen",
@@ -4259,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "postwright-admin"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -4368,6 +4380,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

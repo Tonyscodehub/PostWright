@@ -16,10 +16,12 @@ $B $C user add amy@poffles.test --password 'BatteryStaple2' >/dev/null
 $B $C alias add hello@poffles.test amy@poffles.test >/dev/null
 $B $C alias add info@poffles.test tony@johncock.test >/dev/null
 $B $C domain catch-all poffles.test amy@poffles.test >/dev/null
+$B $C user admin tony@johncock.test >/dev/null
 
 start postwright.toml; echo "core:";     timeout 150 python3 -I $T/e2e.py | grep -E "FAIL|passed"
 start postwright.toml; echo "dkim:";     python3 -I $T/dkim_check.py
 start postwright.toml; echo "features:"; timeout 150 python3 -I $T/e2e_features.py | grep -E "FAIL|passed"
+start postwright.toml; echo "admin:";    timeout 150 python3 -I $T/admin_check.py | grep -E "FAIL|passed"
 # Scanner suite: real ClamAV, Rspamd and SpamAssassin must be running.
 start filter.toml;     echo "filters:";  timeout 150 python3 -I $T/filter_check.py | grep -E "FAIL|passed"
 stop
@@ -27,3 +29,5 @@ stop
 start filter.toml; echo "certs:"; cp /tmp/pwtest/data/tls/cert.pem /tmp/pwtest/cert.bak; cp /tmp/pwtest/data/tls/key.pem /tmp/pwtest/key.bak
 timeout 200 python3 -I $T/cert_check.py | grep -E "FAIL|passed"
 stop; cp /tmp/pwtest/cert.bak /tmp/pwtest/data/tls/cert.pem; cp /tmp/pwtest/key.bak /tmp/pwtest/data/tls/key.pem
+# Two-step verification, app passwords, delegation, send on behalf (fresh database).
+$T/run_security.sh

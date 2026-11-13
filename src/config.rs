@@ -111,6 +111,9 @@ pub struct SecurityConfig {
     /// Networks (CIDR) the admin console and admin API may be used from. Defaults to
     /// loopback and private ranges, so administration isn't exposed to the internet.
     pub admin_networks: Vec<String>,
+    /// Refuse the admin console and admin API to administrators who haven't turned on
+    /// two-factor authentication.
+    pub require_mfa_for_admins: bool,
 }
 
 impl Default for Config {
@@ -201,6 +204,7 @@ impl Default for SecurityConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            require_mfa_for_admins: false,
         }
     }
 }

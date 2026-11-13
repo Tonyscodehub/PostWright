@@ -518,3 +518,26 @@ pub fn find_header_end(data: &[u8]) -> usize {
     }
     data.len()
 }
+
+/// Remove every occurrence of a header (including folded continuation lines).
+pub fn strip_header(data: &[u8], name: &str) -> Vec<u8> {
+    let end = find_header_end(data);
+    let mut out = Vec::with_capacity(data.len());
+    let mut skipping = false;
+    let mut i = 0;
+    while i < end {
+        let nl = data[i..end].iter().position(|&b| b == b'\n').map(|p| i + p + 1).unwrap_or(end);
+        let line = &data[i..nl];
+        let cont = matches!(line.first(), Some(b' ') | Some(b'\t'));
+        if !cont {
+            let colon = line.iter().position(|&b| b == b':');
+            skipping = colon.map(|c| line[..c].trim_ascii().eq_ignore_ascii_case(name.as_bytes())).unwrap_or(false);
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+        i = nl;
+    }
+    out.extend_from_slice(&data[end..]);
+    out
+}

@@ -31,11 +31,21 @@
   .swatch { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
   code { font-size:13px; background:var(--bg); padding:2px 5px; border-radius:4px; }
   .inline { display:flex; gap:8px; align-items:center; margin-top:6px; }
-  .inline input[type=email] { flex:1; }
+  .inline input[type=email], .inline input[type=text] { flex:1; min-width:180px; }
+  .inline select { width:auto; }
+  .qr { display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap; margin-top:10px; }
+  .qr img { width:220px; height:220px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .secret { font-family:ui-monospace, Consolas, monospace; font-size:14px; word-break:break-all; }
+  .codes { columns:2; font-family:ui-monospace, Consolas, monospace; font-size:15px; background:var(--bg); padding:12px 16px; border-radius:8px; margin:10px 0; }
+  .newpw { font-family:ui-monospace, Consolas, monospace; font-size:20px; letter-spacing:1px; background:var(--bg); padding:10px 14px; border-radius:8px; display:inline-block; margin-top:8px; user-select:all; }
+  .badge { display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px; background:var(--bg); border:1px solid var(--line); margin-left:6px; font-weight:400; }
+  .badge.on { color:var(--ok); border-color:var(--ok); }
+  .hidden { display:none; }
+  header a { margin-left:16px; color:var(--accent); }
 </style>
 </head>
 <body>
-<header><h1>Postwright</h1><span id="who"></span></header>
+<header><h1>Postwright</h1><span><span id="who"></span><span id="admin-link"></span><a href="#" id="signout">Sign out</a></span></header>
 <main>
   <section>
     <h2>Out of office</h2>
@@ -66,10 +76,66 @@
 
   <section>
     <h2>Calendars</h2>
-    <p class="hint">Add this server to Thunderbird, Apple Calendar or DAVx5 using <code id="caldav-url"></code> with your email address and password.</p>
+    <p class="hint">Add this server to Thunderbird, Apple Calendar or DAVx5 using <code id="caldav-url"></code> with your email address and password (or an app password, once two-step verification is on).</p>
     <table><thead><tr><th>Calendar</th><th>Owner</th><th>Shared with</th><th></th></tr></thead><tbody id="cal-rows"></tbody></table>
     <div class="inline"><input type="text" id="new-cal" placeholder="New calendar name"><button class="secondary" id="add-cal">Create</button></div>
     <span class="status" id="cal-status"></span>
+  </section>
+
+  <section>
+    <h2>Two-step verification <span class="badge" id="mfa-badge">Off</span></h2>
+    <p class="hint">Asks for a code from an authenticator app (Microsoft Authenticator, Google Authenticator, Authy, 1Password, Bitwarden…) as well as your password when you sign in here or in Mailwright.</p>
+    <div id="mfa-off">
+      <button id="mfa-start">Set up an authenticator app</button>
+      <div id="mfa-enrol" class="hidden">
+        <div class="qr">
+          <img id="mfa-qr" alt="QR code for your authenticator app">
+          <div style="flex:1; min-width:240px">
+            <p><b>1.</b> In your authenticator app, add an account and scan this code.</p>
+            <p class="hint">Can't scan? Enter this key instead:<br><span class="secret" id="mfa-secret"></span></p>
+            <p><b>2.</b> Type the 6-digit code it shows.</p>
+            <div class="inline"><input type="text" id="mfa-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456"><button class="secondary" id="mfa-confirm">Turn on</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="mfa-codes" class="hidden">
+      <p><b>Save these recovery codes</b> somewhere safe (a password manager, or print them). Each one works once if you lose your phone. They won't be shown again.</p>
+      <div class="codes" id="mfa-code-list"></div>
+      <p class="hint">Mail apps other than Mailwright (Outlook, Thunderbird, phone mail apps) now need an app password – make one below.</p>
+    </div>
+    <div id="mfa-on" class="hidden">
+      <p class="hint" id="mfa-info"></p>
+      <div class="row">
+        <div><label for="mfa-dis-pw">Password</label><input type="password" id="mfa-dis-pw" autocomplete="current-password"></div>
+        <div><label for="mfa-dis-code">Code from your app (or a recovery code)</label><input type="text" id="mfa-dis-code" autocomplete="one-time-code"></div>
+      </div>
+      <button class="secondary" style="margin-top:14px" id="mfa-newcodes">New recovery codes</button>
+      <button class="secondary" style="margin-top:14px" id="mfa-disable">Turn off two-step verification</button>
+    </div>
+    <span class="status" id="mfa-status"></span>
+  </section>
+
+  <section>
+    <h2>App passwords</h2>
+    <p class="hint">Mail apps that can't ask for a code (Outlook, Thunderbird, iPhone and Android mail, calendar apps) sign in with an app password instead of your real one. Make one per app so you can remove it if a device is lost. Only needed once two-step verification is on.</p>
+    <table><thead><tr><th>Name</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="ap-rows"></tbody></table>
+    <div class="inline"><input type="text" id="ap-name" placeholder="e.g. Outlook on laptop" maxlength="60"><button class="secondary" id="ap-add">Create</button></div>
+    <div id="ap-new" class="hidden"><p style="margin:12px 0 0">Enter this in the app as the password. It won't be shown again:</p><span class="newpw" id="ap-pw"></span></div>
+    <span class="status" id="ap-status"></span>
+  </section>
+
+  <section>
+    <h2>Signed-in browsers and apps</h2>
+    <p class="hint">Where you're signed in to these pages, the admin app and Mailwright. Remove anything you don't recognise.</p>
+    <table><thead><tr><th>What</th><th>Signed in</th><th>Last active</th><th></th></tr></thead><tbody id="dev-rows"></tbody></table>
+    <span class="status" id="dev-status"></span>
+  </section>
+
+  <section id="shared-section" class="hidden">
+    <h2>Mailboxes shared with you</h2>
+    <p class="hint">These appear in your mail app under <b>Other Users</b>. If they don't show up, check the folder list or "subscribe" to them.</p>
+    <table><thead><tr><th>Mailbox</th><th>Access</th><th>Sending</th></tr></thead><tbody id="sh-rows"></tbody></table>
   </section>
 
   <section>

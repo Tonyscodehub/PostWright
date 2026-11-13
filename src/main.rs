@@ -7,6 +7,7 @@ mod config;
 mod delivery;
 mod filter;
 mod http;
+mod identity;
 mod imap;
 mod iredmail;
 mod logbuf;
@@ -75,6 +76,11 @@ enum Cmd {
     Import {
         #[command(subcommand)]
         cmd: ImportCmd,
+    },
+    /// Let one user open another's mailbox and/or send from their address.
+    Delegate {
+        #[command(subcommand)]
+        cmd: DelegateCmd,
     },
     /// Inspect the outbound queue.
     Queue {
@@ -179,6 +185,9 @@ enum UserCmd {
         #[arg(long)]
         off: bool,
     },
+    /// Turn off two-factor authentication for a user who has lost their phone and
+    /// recovery codes. Also signs them out everywhere and removes their app passwords.
+    MfaReset { email: String },
     /// Set or clear a user's out-of-office auto-reply.
     Vacation {
         email: String,
@@ -230,6 +239,24 @@ enum CalendarCmd {
 }
 
 #[derive(Subcommand)]
+enum DelegateCmd {
+    /// Give GRANTEE access to OWNER's mailbox and/or permission to send from it.
+    Grant {
+        owner: String,
+        grantee: String,
+        /// Mailbox access: none, read or full.
+        #[arg(long, default_value = "full")]
+        mailbox: String,
+        /// Sending: none, on-behalf (recipients see "X on behalf of OWNER") or as.
+        #[arg(long, default_value = "none")]
+        send: String,
+    },
+    /// Remove all of GRANTEE's access to OWNER's mailbox.
+    Revoke { owner: String, grantee: String },
+    List,
+}
+
+#[derive(Subcommand)]
 enum AliasCmd {
     Add { source: String, target: String },
     Remove { source: String, target: Option<String> },
@@ -256,6 +283,7 @@ fn main() -> Result<()> {
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
         Cmd::Queue { cmd } => queue_cmd(&cfg, cmd),
         Cmd::Calendar { cmd } => calendar_cmd(&cfg, cmd),
+        Cmd::Delegate { cmd } => delegate_cmd(&cfg, cmd),
         Cmd::Cert { cmd } => cert_cmd(&cfg, cmd),
         Cmd::Import { cmd: ImportCmd::Iredmail { backend, postfix_dir, dry_run, no_mail, no_calendars, user, sql_cmd } } => {
             let st = open_store(&cfg)?;
@@ -421,7 +449,10 @@ fn user_cmd(cfg: &Config, cmd: UserCmd) -> Result<()> {
             if !st.sync(|c| store::set_password(c, &email, &hash))? {
                 bail!("no such user");
             }
-            println!("Password updated");
+            if let Some(u) = st.sync(|c| store::find_user(c, &email))? {
+                st.sync(|c| identity::end_all_sessions(c, u.id))?;
+            }
+            println!("Password updated (and signed out of the web pages and apps)");
         }
         UserCmd::List => {
             for u in st.sync(|c| store::list_users(c))? {
@@ -453,6 +484,16 @@ fn user_cmd(cfg: &Config, cmd: UserCmd) -> Result<()> {
                 bail!("no such user");
             }
             println!("Enabled {email}");
+        }
+        UserCmd::MfaReset { email } => {
+            let u = st.sync(|c| store::find_user(c, &email))?.ok_or_else(|| anyhow!("no such user"))?;
+            st.sync(|c| {
+                identity::disable(c, u.id)?;
+                identity::end_all_sessions(c, u.id)?;
+                c.execute("DELETE FROM app_passwords WHERE user_id = ?1", [u.id])?;
+                Ok(())
+            })?;
+            println!("Two-factor authentication is off for {email}; they've been signed out and their app passwords removed.");
         }
         UserCmd::Admin { email, off } => {
             if !st.sync(|c| store::set_admin(c, &email, !off))? {
@@ -583,6 +624,28 @@ fn cert_cmd(cfg: &Config, cmd: CertCmd) -> Result<()> {
             std::fs::write(&cfg.tls.key, &k)?;
             std::fs::write(&cfg.tls.cert, &chain)?;
             println!("Installed certificate for {} (expires in {} days)", info.names.join(", "), info.days_left);
+        }
+    }
+    Ok(())
+}
+
+fn delegate_cmd(cfg: &Config, cmd: DelegateCmd) -> Result<()> {
+    let st = open_store(cfg)?;
+    match cmd {
+        DelegateCmd::Grant { owner, grantee, mailbox, send } => {
+            let m = identity::MailboxRight::parse(&mailbox)?;
+            let s = identity::SendRight::parse(&send)?;
+            st.sync(|c| identity::grant(c, &owner.to_ascii_lowercase(), &grantee.to_ascii_lowercase(), m, s))?;
+            println!("{grantee}: mailbox {} access to {owner}, send {}", m.as_str(), s.as_str());
+        }
+        DelegateCmd::Revoke { owner, grantee } => {
+            st.sync(|c| identity::grant(c, &owner.to_ascii_lowercase(), &grantee.to_ascii_lowercase(), identity::MailboxRight::None, identity::SendRight::None))?;
+            println!("Removed {grantee}'s access to {owner}");
+        }
+        DelegateCmd::List => {
+            for d in st.sync(|c| identity::list_all(c))? {
+                println!("{:32} -> {:32} mailbox={:5} send={}", d.grantee, d.owner, d.mailbox.as_str(), d.send.as_str());
+            }
         }
     }
     Ok(())

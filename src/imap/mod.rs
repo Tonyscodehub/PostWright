@@ -24,6 +24,63 @@ struct Selected {
     mb: Mailbox,
     ro: bool,
     msgs: Vec<MsgMeta>,
+    /// Whose mailbox this is (differs from the signed-in user for delegated mailboxes).
+    owner: i64,
+}
+
+/// Where other people's mailboxes appear for users who've been given access.
+pub const SHARED_PREFIX: &str = "Other Users/";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Access {
+    Own,
+    Read,
+    Full,
+}
+
+/// A mailbox name resolved for the signed-in user: one of their own, or one in a mailbox
+/// that has been delegated to them ("Other Users/<owner>/<folder>").
+struct Target {
+    mb: Mailbox,
+    owner: User,
+    access: Access,
+    /// The name as this user sees it.
+    display: String,
+}
+
+fn is_shared_name(name: &str) -> bool {
+    name.get(..SHARED_PREFIX.len()).map(|p| p.eq_ignore_ascii_case(SHARED_PREFIX)).unwrap_or(false) || name.eq_ignore_ascii_case("Other Users")
+}
+
+fn resolve(c: &rusqlite::Connection, user: &User, name: &str) -> Result<Option<Target>> {
+    if name.eq_ignore_ascii_case("Other Users") {
+        return Ok(None);
+    }
+    if !is_shared_name(name) {
+        return Ok(store::find_mailbox(c, user.id, name)?.map(|mb| Target {
+            display: mb.name.clone(),
+            mb,
+            owner: user.clone(),
+            access: Access::Own,
+        }));
+    }
+    let rest = &name[SHARED_PREFIX.len()..];
+    let Some((email, folder)) = rest.split_once('/') else { return Ok(None) };
+    if folder.is_empty() {
+        return Ok(None);
+    }
+    let Some(d) = crate::identity::granted_to(c, user.id)?.into_iter().find(|d| d.owner.eq_ignore_ascii_case(email)) else {
+        return Ok(None);
+    };
+    let access = match d.mailbox {
+        crate::identity::MailboxRight::Full => Access::Full,
+        crate::identity::MailboxRight::Read => Access::Read,
+        crate::identity::MailboxRight::None => return Ok(None),
+    };
+    let Some(owner) = store::user_by_id(c, d.owner_id)? else { return Ok(None) };
+    let Some(mb) = store::find_mailbox(c, owner.id, folder)? else { return Ok(None) };
+    let display = format!("{SHARED_PREFIX}{}/{}", owner.email, mb.name);
+    Ok(Some(Target { mb, owner, access, display }))
 }
 
 struct Session {
@@ -126,7 +183,7 @@ impl Session {
         if !self.conn.stream.is_tls() {
             c.push_str(" STARTTLS LOGINDISABLED");
         } else if self.user.is_none() {
-            c.push_str(" AUTH=PLAIN");
+            c.push_str(" AUTH=PLAIN AUTH=OAUTHBEARER AUTH=XOAUTH2");
         }
         c
     }
@@ -231,7 +288,7 @@ impl Session {
                 Ok(("OK LOGOUT completed".into(), Flow::Logout))
             }
             "ID" => {
-                self.conn.send("* ID (\"name\" \"Postwright\" \"version\" \"0.1.0\")").await?;
+                self.conn.send(concat!("* ID (\"name\" \"Postwright\" \"version\" \"", env!("CARGO_PKG_VERSION"), "\")")).await?;
                 ok("ID completed")
             }
             "STARTTLS" => {
@@ -254,11 +311,14 @@ impl Session {
             }
             "AUTHENTICATE" => {
                 let mech = args.first().and_then(|t| t.atom_upper()).ok_or_else(|| bad("Missing mechanism"))?;
-                if mech != "PLAIN" {
+                if !matches!(mech.as_str(), "PLAIN" | "OAUTHBEARER" | "XOAUTH2") {
                     return Err(no("Unsupported authentication mechanism"));
                 }
                 if !self.conn.stream.is_tls() {
                     return Err(no("[PRIVACYREQUIRED] Use STARTTLS first"));
+                }
+                if self.user.is_some() {
+                    return Err(bad("Already authenticated"));
                 }
                 let resp = match args.get(1).and_then(|t| t.as_str()) {
                     Some(r) if r != "=" => r,
@@ -269,6 +329,9 @@ impl Session {
                 };
                 if resp.trim() == "*" {
                     return Err(bad("Authentication cancelled"));
+                }
+                if mech != "PLAIN" {
+                    return self.login_token(&resp).await;
                 }
                 match auth::decode_plain(&resp) {
                     Some((u, p)) => self.login(&u, &p).await,
@@ -282,13 +345,16 @@ impl Session {
             }
             "NAMESPACE" => {
                 self.user()?;
-                self.conn.send("* NAMESPACE ((\"\" \"/\")) NIL NIL").await?;
+                self.conn.send("* NAMESPACE ((\"\" \"/\")) ((\"Other Users/\" \"/\")) NIL").await?;
                 ok("NAMESPACE completed")
             }
             "SELECT" | "EXAMINE" => self.select(args, cmd == "EXAMINE").await,
             "CREATE" => {
                 let uid_ = self.user()?.id;
                 let name = mailbox_arg(args)?;
+                if is_shared_name(&name) {
+                    return Err(no("[NOPERM] Only the mailbox owner can create folders there"));
+                }
                 let n2 = name.clone();
                 let exists = self.srv.store.call(move |c| store::find_mailbox(c, uid_, &n2)).await?.is_some();
                 if exists {
@@ -300,6 +366,9 @@ impl Session {
             "DELETE" => {
                 let uid_ = self.user()?.id;
                 let name = mailbox_arg(args)?;
+                if is_shared_name(&name) {
+                    return Err(no("[NOPERM] Only the mailbox owner can delete folders there"));
+                }
                 if self.sel.as_ref().map(|s| s.mb.name == store::normalise_mailbox(&name)).unwrap_or(false) {
                     self.sel = None;
                 }
@@ -310,6 +379,9 @@ impl Session {
                 let uid_ = self.user()?.id;
                 let from = mailbox_arg(args)?;
                 let to = args.get(1).and_then(|t| t.as_str()).ok_or_else(|| bad("Missing new name"))?;
+                if is_shared_name(&from) || is_shared_name(&to) {
+                    return Err(no("[NOPERM] Only the mailbox owner can rename folders there"));
+                }
                 self.srv.store.call(move |c| store::rename_mailbox(c, uid_, &from, &to)).await.map_err(|e| no(e.to_string()))?;
                 ok("RENAME completed")
             }
@@ -317,6 +389,10 @@ impl Session {
                 let uid_ = self.user()?.id;
                 let name = mailbox_arg(args)?;
                 let sub = cmd == "SUBSCRIBE";
+                if is_shared_name(&name) {
+                    // Shared folders are always listed; nothing to store.
+                    return ok(&format!("{cmd} completed"));
+                }
                 self.srv.store.call(move |c| store::set_subscribed(c, uid_, &name, sub)).await?;
                 ok(&format!("{cmd} completed"))
             }
@@ -330,9 +406,9 @@ impl Session {
                     let mbid = s.mb.id;
                     let del: Vec<u32> = s.msgs.iter().filter(|m| m.flags.iter().any(|f| f == "\\Deleted")).map(|m| m.uid).collect();
                     if !del.is_empty() {
+                        let owner = s.owner;
                         self.srv.store.call(move |c| store::expunge_uids(c, mbid, &del)).await?;
-                        let id = self.user()?.id;
-                        self.srv.notify_user(id);
+                        self.srv.notify_user(owner);
                     }
                 }
                 self.sel = None;
@@ -374,20 +450,65 @@ impl Session {
         }
     }
 
+    /// OAUTHBEARER / XOAUTH2 sign-in with a device token from /api/v1/login (Mailwright).
+    async fn login_token(&mut self, resp: &str) -> Result<(String, Flow)> {
+        if self.user.is_some() {
+            return Err(bad("Already authenticated"));
+        }
+        let ip = self.peer.ip();
+        if self.srv.guard.is_blocked(ip) {
+            return Err(no("[UNAVAILABLE] Too many failed logins, try later"));
+        }
+        let user = match auth::decode_bearer(resp) {
+            Some((who, token)) => auth::token_login(&self.srv.store, who.as_deref(), &token).await?,
+            None => None,
+        };
+        match user {
+            Some(u) => {
+                self.srv.guard.record_success(ip);
+                tracing::info!("IMAP token login {} from {}", u.email, ip);
+                self.user = Some(u);
+                Ok((format!("OK [CAPABILITY {}] Logged in", self.capabilities()), Flow::Continue))
+            }
+            None => {
+                self.srv.guard.record_failure(ip);
+                tracing::warn!("IMAP token login failed from {ip}");
+                // RFC 7628: send the error as a challenge, the client answers with ^A.
+                self.conn.send(&format!("+ {}", auth::BEARER_ERROR_B64)).await?;
+                let _ = self.conn.read_line().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Err(no("[AUTHENTICATIONFAILED] Invalid or expired token"))
+            }
+        }
+    }
+
     async fn select(&mut self, args: &[Tok], ro: bool) -> Result<(String, Flow)> {
-        let uid_ = self.user()?.id;
+        let user = self.user()?.clone();
         self.sel = None;
         let name = mailbox_arg(args)?;
-        let (mb, msgs) = self
+        let (t, msgs) = self
             .srv
             .store
             .call(move |c| {
-                let Some(mb) = store::find_mailbox(c, uid_, &name)? else { return Ok(None) };
-                let msgs = store::list_messages(c, mb.id)?;
-                Ok(Some((mb, msgs)))
+                let Some(t) = resolve(c, &user, &name)? else { return Ok(None) };
+                let msgs = store::list_messages(c, t.mb.id)?;
+                Ok(Some((t, msgs)))
             })
             .await?
             .ok_or_else(|| no("[NONEXISTENT] Mailbox does not exist"))?;
+        if t.access != Access::Own {
+            tracing::info!(
+                "{} opened {}'s folder {} ({}) from {}",
+                self.user()?.email,
+                t.owner.email,
+                t.mb.name,
+                if t.access == Access::Read { "read only" } else { "full access" },
+                self.peer.ip()
+            );
+        }
+        let ro = ro || t.access == Access::Read;
+        let owner = t.owner.id;
+        let mb = t.mb;
         let mut out = vec![
             format!("* FLAGS ({})", SYSTEM_FLAGS.join(" ")),
             format!("* OK [PERMANENTFLAGS ({} \\*)] Flags permitted", SYSTEM_FLAGS.join(" ")),
@@ -402,7 +523,7 @@ impl Session {
         for l in out {
             self.conn.send(&l).await?;
         }
-        self.sel = Some(Selected { mb, ro, msgs });
+        self.sel = Some(Selected { mb, ro, msgs, owner });
         Ok((
             format!("OK [{}] {} completed", if ro { "READ-ONLY" } else { "READ-WRITE" }, if ro { "EXAMINE" } else { "SELECT" }),
             Flow::Continue,
@@ -494,11 +615,50 @@ impl Session {
             }
             self.conn.send(&format!("* {word} ({}) \"/\" {}", attrs.join(" "), q(&b.name))).await?;
         }
+        // Mailboxes other people have shared with this user.
+        let shared = self
+            .srv
+            .store
+            .call(move |c| {
+                let mut out: Vec<(String, Vec<Mailbox>)> = Vec::new();
+                for d in crate::identity::granted_to(c, uid_)? {
+                    if d.mailbox == crate::identity::MailboxRight::None {
+                        continue;
+                    }
+                    out.push((d.owner.clone(), store::list_mailboxes(c, d.owner_id)?));
+                }
+                Ok(out)
+            })
+            .await?;
+        if !shared.is_empty() {
+            let mut entries: Vec<(String, Vec<String>)> = vec![("Other Users".into(), vec!["\\Noselect".into(), "\\HasChildren".into()])];
+            for (owner, boxes) in &shared {
+                entries.push((format!("{SHARED_PREFIX}{owner}"), vec!["\\Noselect".into(), "\\HasChildren".into()]));
+                let names: Vec<&str> = boxes.iter().map(|b| b.name.as_str()).collect();
+                for b in boxes {
+                    if subscribed_only && !b.subscribed {
+                        continue;
+                    }
+                    let prefix = format!("{}/", b.name);
+                    let mut attrs = vec![if names.iter().any(|n| n.starts_with(&prefix)) { "\\HasChildren" } else { "\\HasNoChildren" }.to_string()];
+                    if subscribed_only && !lsub {
+                        attrs.push("\\Subscribed".into());
+                    }
+                    entries.push((format!("{SHARED_PREFIX}{owner}/{}", b.name), attrs));
+                }
+            }
+            for (name, attrs) in entries {
+                let hit = patterns.iter().any(|p| pattern_match(&format!("{reference}{p}").chars().collect::<Vec<_>>(), &name.chars().collect::<Vec<_>>()));
+                if hit {
+                    self.conn.send(&format!("* {word} ({}) \"/\" {}", attrs.join(" "), q(&name))).await?;
+                }
+            }
+        }
         Ok((format!("OK {word} completed"), Flow::Continue))
     }
 
     async fn status(&mut self, args: &[Tok]) -> Result<(String, Flow)> {
-        let uid_ = self.user()?.id;
+        let user = self.user()?.clone();
         let name = mailbox_arg(args)?;
         let Some(Tok::List(items)) = args.get(1) else { return Err(bad("Missing status items")) };
         let n2 = name.clone();
@@ -506,8 +666,10 @@ impl Session {
             .srv
             .store
             .call(move |c| {
-                let Some(mb) = store::find_mailbox(c, uid_, &n2)? else { return Ok(None) };
-                let m = store::list_messages(c, mb.id)?;
+                let Some(t) = resolve(c, &user, &n2)? else { return Ok(None) };
+                let m = store::list_messages(c, t.mb.id)?;
+                let mut mb = t.mb;
+                mb.name = t.display;
                 Ok(Some((mb, m)))
             })
             .await?
@@ -563,22 +725,25 @@ impl Session {
         }
         let size = data.len() as i64;
         let blob = self.srv.store.put_blob(Arc::new(data.clone())).await?;
-        let uidv = user.id;
         let res = self
             .srv
             .store
             .call(move |c| {
-                let Some(mb) = store::find_mailbox(c, uidv, &name)? else { return Ok(Err("[TRYCREATE] Mailbox does not exist")) };
-                if user.quota_bytes > 0 && store::user_usage(c, user.id)? + size > user.quota_bytes {
+                let Some(t) = resolve(c, &user, &name)? else { return Ok(Err("[TRYCREATE] Mailbox does not exist")) };
+                if t.access == Access::Read {
+                    return Ok(Err("[NOPERM] You have read-only access to this mailbox"));
+                }
+                let owner = t.owner;
+                if owner.quota_bytes > 0 && store::user_usage(c, owner.id)? + size > owner.quota_bytes {
                     return Ok(Err("[OVERQUOTA] Quota exceeded"));
                 }
-                let uid = store::append_message(c, mb.id, &blob, size, date, &flags)?;
-                Ok(Ok((mb.uidvalidity, uid)))
+                let uid = store::append_message(c, t.mb.id, &blob, size, date, &flags)?;
+                Ok(Ok((t.mb.uidvalidity, uid, owner.id)))
             })
             .await?;
         match res {
-            Ok((v, uid)) => {
-                self.srv.notify_user(uidv);
+            Ok((v, uid, owner)) => {
+                self.srv.notify_user(owner);
                 Ok((format!("OK [APPENDUID {v} {uid}] APPEND completed"), Flow::Continue))
             }
             Err(e) => Err(no(e)),
@@ -604,7 +769,7 @@ impl Session {
                 }
                 r = self.changes.recv() => {
                     match r {
-                        Ok(u) if u == uid_ => changed = true,
+                        Ok(u) if u == uid_ || Some(u) == self.sel.as_ref().map(|s| s.owner) => changed = true,
                         Err(broadcast::error::RecvError::Lagged(_)) => changed = true,
                         _ => {}
                     }
@@ -637,7 +802,8 @@ impl Session {
     }
 
     async fn expunge(&mut self, args: &[Tok], uid: bool) -> Result<(String, Flow)> {
-        let user_id = self.user()?.id;
+        self.user()?;
+        let user_id = self.sel()?.owner;
         let only: Option<SeqSet> = if uid {
             Some(SeqSet::parse(&args.first().and_then(|t| t.as_str()).ok_or_else(|| bad("Missing UID set"))?)?)
         } else {
@@ -800,7 +966,7 @@ impl Session {
             self.conn.write(&out).await?;
         }
         if any_seen {
-            let id = self.user()?.id;
+            let id = self.sel()?.owner;
             self.srv.notify_user(id);
         }
         Ok(("OK FETCH completed".into(), Flow::Continue))
@@ -874,14 +1040,14 @@ impl Session {
             }
         }
         if n > 0 {
-            let id = self.user()?.id;
+            let id = self.sel()?.owner;
             self.srv.notify_user(id);
         }
         Ok(("OK STORE completed".into(), Flow::Continue))
     }
 
     async fn copy(&mut self, args: &[Tok], uid: bool, mv: bool) -> Result<(String, Flow)> {
-        let user_id = self.user()?.id;
+        let user = self.user()?.clone();
         let set = SeqSet::parse(&args.first().and_then(|t| t.as_str()).ok_or_else(|| bad("Missing sequence set"))?)
             .map_err(|e| bad(e.to_string()))?;
         let dest = args.get(1).and_then(|t| t.as_str()).ok_or_else(|| bad("Missing destination"))?;
@@ -891,6 +1057,7 @@ impl Session {
             return Err(no("[READ-ONLY] Mailbox is read-only"));
         }
         let src = sel.mb.id;
+        let src_owner = sel.owner;
         let src_junk = is_junk(&sel.mb);
         let blobs: Vec<String> = idx.iter().map(|&i| sel.msgs[i].blob.clone()).collect();
         let uids: Vec<u32> = idx.iter().map(|&i| sel.msgs[i].uid).collect();
@@ -898,12 +1065,19 @@ impl Session {
             .srv
             .store
             .call(move |c| {
-                let Some(dst) = store::find_mailbox(c, user_id, &dest)? else { return Ok(None) };
+                let Some(t) = resolve(c, &user, &dest)? else { return Ok(None) };
+                if t.access == Access::Read {
+                    return Ok(Some(Err(())));
+                }
+                let dst = t.mb;
                 let pairs = if mv { store::move_messages(c, src, dst.id, &uids)? } else { store::copy_messages(c, src, dst.id, &uids)? };
-                Ok(Some((dst.uidvalidity, pairs, is_junk(&dst), dst.special.as_deref() == Some("\\Trash") || dst.name == "Trash")))
+                Ok(Some(Ok((dst.uidvalidity, pairs, is_junk(&dst), dst.special.as_deref() == Some("\\Trash") || dst.name == "Trash", t.owner.id))))
             })
             .await?;
-        let Some((validity, pairs, dst_junk, dst_trash)) = res else { return Err(no("[TRYCREATE] Destination mailbox does not exist")) };
+        let Some(res) = res else { return Err(no("[TRYCREATE] Destination mailbox does not exist")) };
+        let Ok((validity, pairs, dst_junk, dst_trash, dst_owner)) = res else {
+            return Err(no("[NOPERM] You have read-only access to the destination mailbox"));
+        };
         // Moving mail into Junk teaches the spam filter; rescuing it from Junk teaches ham.
         let email = self.user()?.email.clone();
         if dst_junk && !src_junk {
@@ -918,7 +1092,10 @@ impl Session {
             let d: Vec<u32> = pairs.iter().map(|p| p.1).collect();
             format!("[COPYUID {validity} {} {}] ", compact(&s), compact(&d))
         };
-        self.srv.notify_user(user_id);
+        self.srv.notify_user(src_owner);
+        if dst_owner != src_owner {
+            self.srv.notify_user(dst_owner);
+        }
         if mv {
             if !code.is_empty() {
                 self.conn.send(&format!("* OK {}Moved", code)).await?;

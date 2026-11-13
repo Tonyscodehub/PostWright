@@ -3,6 +3,7 @@
 
 use crate::auth;
 use crate::caldav;
+use crate::identity;
 use crate::net::Stream;
 use crate::prefs;
 use crate::server::Shared;
@@ -157,40 +158,63 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     if p == "/favicon.ico" {
         return builder(StatusCode::NO_CONTENT).body(Full::default()).unwrap();
     }
-    if r.method == "OPTIONS" && (p == "/" || p.starts_with("/dav")) {
-        // Some clients probe OPTIONS before authenticating.
-        if let Some(u) = authenticate(&srv, peer, &r).await {
-            return caldav::handle(srv, u, r).await;
-        }
+    if p == "/login" {
+        return page(LOGIN_HTML);
     }
-    let Some(user) = authenticate(&srv, peer, &r).await else {
-        if srv.guard.is_blocked(peer.ip()) {
-            return text(StatusCode::TOO_MANY_REQUESTS, "Too many failed logins, try later");
-        }
-        return unauthorised();
-    };
-    if p == "/" && r.method == "GET" || p == "/settings" {
+    if p == "/login.js" {
         return builder(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .header("Cache-Control", "no-store")
-            .header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
-            .header("X-Frame-Options", "DENY")
-            .header("Referrer-Policy", "no-referrer")
-            .body(Full::new(Bytes::from_static(SETTINGS_HTML.as_bytes())))
+            .header("Content-Type", "application/javascript; charset=utf-8")
+            .body(Full::new(Bytes::from_static(LOGIN_JS.as_bytes())))
             .unwrap();
+    }
+    if p == "/api/v1/login" && r.method == "POST" {
+        return login(&srv, peer, &r).await;
+    }
+    if p == "/api/v1/logout" && r.method == "POST" {
+        if let Some(t) = session_token(&r) {
+            let _ = srv.store.call(move |c| identity::end_session(c, &t)).await;
+        }
+        return builder(StatusCode::OK)
+            .header("Set-Cookie", "pw_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0")
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
+            .unwrap();
+    }
+
+    // Calendars (CalDAV) use HTTP Basic: account password, or an app password once
+    // two-factor authentication is on. Mailwright may also use its device token.
+    let is_dav = p == "/" && r.method != "GET" || p.starts_with("/dav");
+    if is_dav {
+        let user = match session_user(&srv, &r, &["device"]).await {
+            Some(u) => Some(u),
+            None => basic_user(&srv, peer, &r).await,
+        };
+        return match user {
+            Some(u) => caldav::handle(srv, u, r).await,
+            None if srv.guard.is_blocked(peer.ip()) => text(StatusCode::TOO_MANY_REQUESTS, "Too many failed logins, try later"),
+            None => unauthorised(),
+        };
+    }
+
+    // Everything else uses a sign-in session: a cookie for the web pages, or a bearer
+    // token for the desktop app and Mailwright.
+    let user = session_user(&srv, &r, &["web", "app", "device"]).await;
+    let is_page = r.method == "GET" && (p == "/" || p == "/settings" || p == "/admin" || p == "/admin/");
+    let Some(user) = user else {
+        if is_page {
+            let next = if p == "/" { String::new() } else { format!("?next={}", enc_path(&p)) };
+            return builder(StatusCode::SEE_OTHER).header("Location", format!("/login{next}")).body(Full::default()).unwrap();
+        }
+        return json_err(StatusCode::UNAUTHORIZED, "sign in required");
+    };
+    if p == "/" || p == "/settings" {
+        return page(SETTINGS_HTML);
     }
     if p == "/admin" || p == "/admin/" {
         if !user.is_admin || !crate::admin::in_networks(peer.ip(), &srv.cfg.security.admin_networks) {
             return text(StatusCode::FORBIDDEN, "Administration is not available for this account or from this network.");
         }
-        return builder(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .header("Cache-Control", "no-store")
-            .header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
-            .header("X-Frame-Options", "DENY")
-            .header("Referrer-Policy", "no-referrer")
-            .body(Full::new(Bytes::from_static(ADMIN_HTML.as_bytes())))
-            .unwrap();
+        return page(ADMIN_HTML);
     }
     if let Some(rest) = p.strip_prefix("/api/v1/admin/") {
         if r.method != "GET" && r.method != "DELETE" && !r.header("content-type").unwrap_or_default().starts_with("application/json") {
@@ -201,10 +225,98 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     if let Some(rest) = p.strip_prefix("/api/v1/") {
         return api(&srv, user, &r, rest).await;
     }
-    if p == "/" || p.starts_with("/dav") {
-        return caldav::handle(srv, user, r).await;
-    }
     text(StatusCode::NOT_FOUND, "Not found")
+}
+
+fn page(html: &'static str) -> Resp {
+    builder(StatusCode::OK)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'")
+        .header("X-Frame-Options", "DENY")
+        .header("Referrer-Policy", "no-referrer")
+        .body(Full::new(Bytes::from_static(html.as_bytes())))
+        .unwrap()
+}
+
+/// Session token from the Authorization: Bearer header or the pw_session cookie.
+pub fn session_token(r: &Req) -> Option<String> {
+    if let Some(h) = r.header("authorization") {
+        if let Some(t) = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")) {
+            return Some(t.trim().to_string());
+        }
+    }
+    let cookies = r.header("cookie")?;
+    cookies.split(';').find_map(|c| c.trim().strip_prefix("pw_session=").map(|v| v.to_string())).filter(|v| !v.is_empty())
+}
+
+async fn session_user(srv: &Shared, r: &Req, kinds: &'static [&'static str]) -> Option<User> {
+    let t = session_token(r)?;
+    srv.store.call(move |c| identity::session_user(c, &t, kinds)).await.ok().flatten()
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    email: String,
+    password: String,
+    #[serde(default)]
+    code: Option<String>,
+    /// "web" (default, sets a cookie), "app" (admin desktop app) or "device" (mail app).
+    #[serde(default)]
+    kind: Option<String>,
+    /// Shown on the user's "signed-in apps" list, e.g. "Mailwright on LEGION".
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn login(srv: &Shared, peer: SocketAddr, r: &Req) -> Resp {
+    let ip = peer.ip();
+    if srv.guard.is_blocked(ip) {
+        return json_err(StatusCode::TOO_MANY_REQUESTS, "Too many failed sign-ins. Try again later.");
+    }
+    let Ok(req) = serde_json::from_slice::<LoginReq>(&r.body) else { return json_err(StatusCode::BAD_REQUEST, "invalid request") };
+    let kind = match req.kind.as_deref().unwrap_or("web") {
+        k @ ("web" | "app" | "device") => k,
+        _ => return json_err(StatusCode::BAD_REQUEST, "unknown kind"),
+    };
+    let res = match auth::web_login(&srv.store, &req.email, &req.password, req.code.as_deref()).await {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::error!("login error: {e:#}");
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed");
+        }
+    };
+    let user = match res {
+        auth::WebLogin::Ok(u) => u,
+        auth::WebLogin::NeedCode => {
+            return json(StatusCode::UNAUTHORIZED, &serde_json::json!({ "mfa_required": true, "error": "Enter the code from your authenticator app." }));
+        }
+        auth::WebLogin::Fail => {
+            srv.guard.record_failure(ip);
+            tracing::warn!("sign-in failed for {} from {ip}", req.email);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let msg = if req.code.as_deref().map(|c| !c.trim().is_empty()).unwrap_or(false) {
+                "That code isn't right, or it has already been used."
+            } else {
+                "Wrong email address or password."
+            };
+            return json(StatusCode::UNAUTHORIZED, &serde_json::json!({ "error": msg }));
+        }
+    };
+    srv.guard.record_success(ip);
+    let (uid, name) = (user.id, req.name.clone());
+    let kind_s = kind.to_string();
+    let token = match srv.store.call(move |c| identity::create_session(c, uid, &kind_s, name.as_deref())).await {
+        Ok(t) => t,
+        Err(_) => return json_err(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed"),
+    };
+    tracing::info!("{} signed in ({kind}) from {ip}", user.email);
+    let body = serde_json::json!({ "email": user.email, "is_admin": user.is_admin, "token": if kind == "web" { None } else { Some(&token) } });
+    let mut b = builder(StatusCode::OK).header("Content-Type", "application/json").header("Cache-Control", "no-store");
+    if kind == "web" {
+        b = b.header("Set-Cookie", format!("pw_session={token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=604800"));
+    }
+    b.body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap_or_default()))).unwrap()
 }
 
 // ------------------------------------------------------------ authentication
@@ -219,9 +331,10 @@ fn auth_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Basic auth over TLS. Successful logins are cached for a few minutes keyed by a hash of
-/// the credentials, because calendar clients make many requests and Argon2 is deliberately slow.
-async fn authenticate(srv: &Shared, peer: SocketAddr, r: &Req) -> Option<User> {
+/// Basic auth over TLS, for calendar apps. Successful logins are cached for a few minutes
+/// keyed by a hash of the credentials, because calendar apps make many requests and Argon2
+/// is deliberately slow.
+async fn basic_user(srv: &Shared, peer: SocketAddr, r: &Req) -> Option<User> {
     let h = r.header("authorization")?;
     let b64 = h.strip_prefix("Basic ").or_else(|| h.strip_prefix("basic "))?;
     let decoded = auth::b64d(b64)?;
@@ -337,7 +450,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
         }
         ("POST", ["password"]) => {
             let p: PasswordReq = serde_json::from_slice(&r.body)?;
-            if auth::authenticate(&srv.store, &user.email, &p.current).await?.is_none() {
+            if auth::verify_password(&srv.store, &user.email, &p.current).await?.is_none() {
                 return Ok(json_err(StatusCode::FORBIDDEN, "current password is wrong"));
             }
             if p.new.chars().count() < 10 {
@@ -345,9 +458,143 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
             }
             let hash = auth::hash_password(&p.new)?;
             let email = user.email.clone();
-            srv.store.call(move |c| store::set_password(c, &email, &hash)).await?;
+            let keep = session_token(r);
+            srv.store
+                .call(move |c| {
+                    store::set_password(c, &email, &hash)?;
+                    // Sign out everywhere else.
+                    let h = keep.as_deref().map(identity::sha256_hex).unwrap_or_default();
+                    c.execute("DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2", rusqlite::params![uid, h])?;
+                    Ok(())
+                })
+                .await?;
             forget_cached_logins(uid);
             Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        // ---------------------------------------------------- two-factor authentication
+        ("GET", ["mfa"]) => {
+            let st = srv.store.call(move |c| identity::status(c, uid)).await?;
+            Ok(json(StatusCode::OK, &st))
+        }
+        ("POST", ["mfa", "setup"]) => {
+            let issuer = srv.cfg.hostname.clone();
+            let u = user.clone();
+            let e = srv.store.call(move |c| identity::begin_enrolment(c, &u, &issuer)).await?;
+            Ok(json(StatusCode::OK, &e))
+        }
+        ("POST", ["mfa", "confirm"]) => {
+            #[derive(Deserialize)]
+            struct C {
+                code: String,
+            }
+            let b: C = serde_json::from_slice(&r.body)?;
+            let keep = session_token(r);
+            let codes = srv
+                .store
+                .call(move |c| {
+                    let codes = identity::confirm_enrolment(c, uid, &b.code)?;
+                    // Other browsers signed in with just a password are signed out.
+                    let h = keep.as_deref().map(identity::sha256_hex).unwrap_or_default();
+                    c.execute("DELETE FROM sessions WHERE user_id = ?1 AND token_hash != ?2", rusqlite::params![uid, h])?;
+                    Ok(codes)
+                })
+                .await?;
+            forget_cached_logins(uid);
+            tracing::info!("{} turned on two-factor authentication", user.email);
+            Ok(json(StatusCode::OK, &serde_json::json!({ "recovery_codes": codes })))
+        }
+        ("POST", ["mfa", "recovery-codes"]) => {
+            // New recovery codes (old ones stop working). Needs a current code.
+            #[derive(Deserialize)]
+            struct C {
+                code: String,
+            }
+            let b: C = serde_json::from_slice(&r.body)?;
+            let codes = srv
+                .store
+                .call(move |c| {
+                    if !identity::verify_code(c, uid, &b.code)? {
+                        anyhow::bail!("that code isn't right");
+                    }
+                    identity::new_recovery_codes(c, uid)
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "recovery_codes": codes })))
+        }
+        ("POST", ["mfa", "disable"]) => {
+            #[derive(Deserialize)]
+            struct D {
+                password: String,
+                code: String,
+            }
+            let b: D = serde_json::from_slice(&r.body)?;
+            if auth::verify_password(&srv.store, &user.email, &b.password).await?.is_none() {
+                return Ok(json_err(StatusCode::FORBIDDEN, "password is wrong"));
+            }
+            let ok = srv
+                .store
+                .call(move |c| {
+                    if !identity::verify_code(c, uid, &b.code)? {
+                        return Ok(false);
+                    }
+                    identity::disable(c, uid)?;
+                    Ok(true)
+                })
+                .await?;
+            if !ok {
+                return Ok(json_err(StatusCode::FORBIDDEN, "that code isn't right"));
+            }
+            forget_cached_logins(uid);
+            tracing::warn!("{} turned off two-factor authentication", user.email);
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        // ---------------------------------------------------------------- app passwords
+        ("GET", ["app-passwords"]) => {
+            let v = srv.store.call(move |c| identity::list_app_passwords(c, uid)).await?;
+            Ok(json(StatusCode::OK, &v))
+        }
+        ("POST", ["app-passwords"]) => {
+            #[derive(Deserialize)]
+            struct N {
+                name: String,
+            }
+            let b: N = serde_json::from_slice(&r.body)?;
+            let name = b.name.trim().to_string();
+            if name.is_empty() || name.chars().count() > 60 {
+                anyhow::bail!("give the app password a name of up to 60 characters");
+            }
+            let n2 = name.clone();
+            let pw = srv.store.call(move |c| identity::create_app_password(c, uid, &n2)).await?;
+            tracing::info!("{} created app password {name:?}", user.email);
+            Ok(json(StatusCode::OK, &serde_json::json!({ "name": name, "password": pw })))
+        }
+        ("DELETE", ["app-passwords", id]) => {
+            let id: i64 = id.parse()?;
+            let ok = srv.store.call(move |c| identity::delete_app_password(c, uid, id)).await?;
+            forget_cached_logins(uid);
+            if !ok {
+                return Ok(json_err(StatusCode::NOT_FOUND, "no such app password"));
+            }
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        // ------------------------------------------------------------ signed-in devices
+        ("GET", ["devices"]) => {
+            let cur = session_token(r);
+            let v = srv.store.call(move |c| identity::list_sessions(c, uid, cur.as_deref())).await?;
+            Ok(json(StatusCode::OK, &v))
+        }
+        ("DELETE", ["devices", id]) => {
+            let id = id.to_string();
+            let ok = srv.store.call(move |c| identity::end_session_by_id(c, uid, &id)).await?;
+            if !ok {
+                return Ok(json_err(StatusCode::NOT_FOUND, "no such sign-in"));
+            }
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        // ---------------------------------------------------------- delegated mailboxes
+        ("GET", ["shared"]) => {
+            let v = srv.store.call(move |c| identity::granted_to(c, uid)).await?;
+            Ok(json(StatusCode::OK, &v))
         }
         ("GET", ["calendars"]) => {
             let list = srv
@@ -469,6 +716,8 @@ fn autoconfig(srv: &Shared, r: &Req) -> Resp {
 // --------------------------------------------------------------- web page
 
 const SETTINGS_HTML: &str = include_str!("web/settings.html");
+const LOGIN_HTML: &str = include_str!("web/login.html");
+const LOGIN_JS: &str = include_str!("web/login.js");
 const SETTINGS_JS: &str = include_str!("web/settings.js");
 const ADMIN_HTML: &str = include_str!("web/admin.html");
 const ADMIN_JS: &str = include_str!("web/admin.js");

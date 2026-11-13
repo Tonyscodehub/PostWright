@@ -12,6 +12,7 @@ async function api(method, path, body) {
     opts.body = JSON.stringify(body);
   }
   const r = await fetch("/api/v1/admin/" + path, opts);
+  if (r.status === 401) { location.replace("/login?next=/admin"); throw new Error("signed out"); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || r.statusText);
   return data;
@@ -161,7 +162,8 @@ async function users() {
         h("td", { style: "white-space:nowrap" }, u.quota_bytes ? h("span", { class: "bar" }, h("span", { class: pct > 90 ? "full" : "", style: `width:${pct}%` })) : "",
           fmtBytes(u.used_bytes), " / ", u.quota_bytes ? fmtBytes(u.quota_bytes) : "unlimited"),
         h("td", {}, u.enabled ? pill("Active", "ok") : pill("Disabled", "err"), u.admin ? pill("Admin", "info") : "",
-          u.out_of_office ? pill("Out of office", "warn") : "", u.legacy_password ? pill("Imported password", "info") : ""),
+          u.out_of_office ? pill("Out of office", "warn") : "", u.legacy_password ? pill("Imported password", "info") : "",
+          u.mfa ? pill("2-step on", "ok") : ""),
         h("td", { style: "text-align:right;white-space:nowrap" },
           h("button", { class: "ghost", onclick: () => editUser(u, tr) }, "Edit"), " ",
           h("button", { class: "danger", onclick: () => confirm(`Delete ${u.email} and ALL their mail and calendars? This can't be undone.`) &&
@@ -194,7 +196,42 @@ function editUser(u, tr) {
   tr.after(h("tr", { class: "edit" }, h("td", { colspan: 4 }, h("div", { class: "row" },
     h("span", {}, "Quota MB (0 = unlimited)"), quota, pw,
     h("label", { class: "c" }, en, "Enabled"), h("label", { class: "c" }, ad, "Administrator"),
-    h("button", { onclick: () => act(() => api("PUT", "users/" + encodeURIComponent(u.email), { quota_mb: +quota.value || 0, password: pw.value || null, enabled: en.checked, admin: ad.checked }), "Saved") }, "Save")))));
+    h("button", { onclick: () => act(() => api("PUT", "users/" + encodeURIComponent(u.email), { quota_mb: +quota.value || 0, password: pw.value || null, enabled: en.checked, admin: ad.checked }), "Saved") }, "Save"),
+    u.mfa ? h("button", { class: "danger", title: "For someone who has lost their phone and recovery codes", onclick: () =>
+      confirm(`Turn off two-step verification for ${u.email}? They'll be signed out everywhere and their app passwords removed, so they can set it up again.`) &&
+      act(() => api("POST", "users/" + encodeURIComponent(u.email) + "/mfa-reset", {}), "Two-step verification reset") }, "Reset 2-step verification") : "",
+    h("a", { href: "#access", class: "muted", style: "margin-left:8px" }, "Mailbox access…")))));
+}
+
+// ------------------------------------------------------- delegated access
+const ACCESS = { none: "No mailbox access", read: "Read only", full: "Full access" };
+const SEND = { none: "Can't send", on_behalf: "Send on behalf", as: "Send as" };
+
+async function access() {
+  const [list, users] = await Promise.all([api("GET", "delegations"), api("GET", "users")]);
+  const emails = users.map((u) => u.email);
+  const tbody = h("tbody");
+  const pick = (opts, v) => h("select", {}, Object.entries(opts).map(([k, t]) => h("option", { value: k, selected: k === v }, t)));
+  tbody.replaceChildren(...(list.length ? list.map((d) => {
+    const m = pick(ACCESS, d.mailbox), snd = pick(SEND, d.send);
+    const save = () => act(() => api("POST", "delegations", { owner: d.owner, grantee: d.grantee, mailbox: m.value, send: snd.value }), "Saved");
+    m.addEventListener("change", save); snd.addEventListener("change", save);
+    return h("tr", {}, h("td", {}, h("b", {}, d.owner)), h("td", {}, d.grantee), h("td", {}, m), h("td", {}, snd),
+      h("td", { style: "text-align:right" }, h("button", { class: "danger", onclick: () =>
+        act(() => api("DELETE", `delegations?owner=${encodeURIComponent(d.owner)}&grantee=${encodeURIComponent(d.grantee)}`), "Access removed") }, "Remove")));
+  }) : [h("tr", {}, h("td", { colspan: 5, class: "muted" }, "Nobody has access to anyone else's mailbox."))]));
+  const sel = (ph) => h("select", {}, h("option", { value: "" }, ph), emails.map((e) => h("option", {}, e)));
+  const owner = sel("Mailbox…"), grantee = sel("Person…");
+  const m = pick(ACCESS, "full"), snd = pick(SEND, "on_behalf");
+  page("Mailbox access", "Let someone open another person's mailbox, or send from their address. Shared mailboxes appear in the person's mail app under \"Other Users\". Opening someone else's mailbox is written to the log.",
+    h("div", { class: "card" },
+      h("table", {}, h("thead", {}, h("tr", {}, ["Mailbox", "Who", "Mailbox access", "Sending", ""].map((x) => h("th", {}, x)))), tbody)),
+    h("div", { class: "card" }, h("h3", {}, "Give access"),
+      h("div", { class: "row" }, owner, h("span", {}, "to"), grantee, m, snd,
+        h("button", { onclick: () => act(() => api("POST", "delegations", { owner: owner.value, grantee: grantee.value, mailbox: m.value, send: snd.value }), "Access given") }, "Give access")),
+      h("p", { class: "muted", style: "margin-top:12px" },
+        "Read only: can read and search, but not change or delete anything. Full access: can also file, flag, delete and add mail. ",
+        "Send on behalf: recipients see \"Tony on behalf of Amy\". Send as: mail looks exactly as if Amy sent it.")));
 }
 
 // ------------------------------------------------------------------- aliases
@@ -348,7 +385,7 @@ async function logs() {
 }
 
 // -------------------------------------------------------------------- router
-const pages = { overview, domains, users, aliases, queue, filters, certificate, import: importPage, logs };
+const pages = { overview, domains, users, access, aliases, queue, filters, certificate, import: importPage, logs };
 async function route() {
   clearTimeout(timer);
   const name = (location.hash || "#overview").slice(1);
@@ -362,3 +399,8 @@ api("GET", "overview").then((o) => {
   document.getElementById("ver").textContent = "v" + o.version;
 }).catch(() => {});
 route();
+document.getElementById("signout").addEventListener("click", async (ev) => {
+  ev.preventDefault();
+  await fetch("/api/v1/logout", { method: "POST", credentials: "same-origin" }).catch(() => {});
+  location.replace("/login");
+});

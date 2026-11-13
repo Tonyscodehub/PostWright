@@ -11,11 +11,21 @@ def check(name, cond, info=""):
     results.append(bool(cond))
     print(("PASS " if cond else "FAIL ") + name + (f"  [{info}]" if info and not cond else ""))
 
+TOKENS = {}
+def token(who):
+    if who not in TOKENS:
+        c = http.client.HTTPSConnection(H, 8443, context=ctx)
+        c.request("POST", "/api/v1/login", body=json.dumps({"email": who[0], "password": who[1], "kind": "app"}), headers={"Content-Type": "application/json"})
+        r = c.getresponse(); TOKENS[who] = json.loads(r.read())["token"]; c.close()
+    return TOKENS[who]
+
 def req(method, path, who=TONY, body=None, headers=None):
     c = http.client.HTTPSConnection(H, 8443, context=ctx)
     h = dict(headers or {})
-    if who:
+    if who and (path.startswith("/dav") or path.startswith("/.well-known")):
         h["Authorization"] = "Basic " + base64.b64encode(f"{who[0]}:{who[1]}".encode()).decode()
+    elif who:
+        h["Authorization"] = "Bearer " + token(who)
     if isinstance(body, (dict, list)):
         body = json.dumps(body); h.setdefault("Content-Type", "application/json")
     c.request(method, path, body=body, headers=h)
@@ -33,7 +43,7 @@ def queue():
 
 # --- Settings page / API / autoconfig
 s, h, _ = req("GET", "/", who=None)
-check("settings page requires login", s == 401 and "Basic" in h.get("www-authenticate", ""))
+check("settings page requires sign-in", s == 303 and h.get("location") == "/login")
 s, h, body = req("GET", "/")
 check("settings page served with CSP", s == 200 and b"Out of office" in body and "content-security-policy" in h)
 s, _, body = req("GET", "/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress=tony%40johncock.test", who=None)
@@ -136,7 +146,11 @@ s, _, _ = req("GET", shared_href + "x.ics", who=AMY)
 check("unshare revokes access", s == 404)
 
 # --- brute-force on HTTP
-fails = [req("GET", "/api/v1/me", who=("tony@johncock.test", f"bad{i}"))[0] for i in range(6)]
+def bad_login(i):
+    c = http.client.HTTPSConnection(H, 8443, context=ctx)
+    c.request("POST", "/api/v1/login", body=json.dumps({"email": TONY[0], "password": f"bad{i}"}), headers={"Content-Type": "application/json"})
+    r = c.getresponse(); r.read(); c.close(); return r.status
+fails = [bad_login(i) for i in range(6)]
 check("HTTP brute force blocked", fails[-1] == 429, fails)
 
 print(f"\n{sum(results)}/{len(results)} passed")

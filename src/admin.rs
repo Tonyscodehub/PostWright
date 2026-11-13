@@ -67,6 +67,15 @@ pub async fn handle(srv: &Shared, peer: IpAddr, user: User, r: &Req, rest: &str)
     if r.method == "DELETE" && r.header("x-requested-with").is_none() {
         return json_err(StatusCode::FORBIDDEN, "missing X-Requested-With header");
     }
+    if srv.cfg.security.require_mfa_for_admins {
+        let uid = user.id;
+        if !srv.store.call(move |c| crate::identity::enabled(c, uid)).await.unwrap_or(false) {
+            return json_err(
+                StatusCode::FORBIDDEN,
+                "this server requires administrators to use two-factor authentication: turn it on in your account settings first",
+            );
+        }
+    }
     match route(srv, &user, r, rest).await {
         Ok(v) => json(StatusCode::OK, &v),
         Err(e) => json_err(StatusCode::BAD_REQUEST, &format!("{e:#}")),
@@ -259,6 +268,7 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                         let addrs = store::sender_addresses(c, &u)?;
                         let fwd = store::alias_targets(c, &u.email)?;
                         let vac = crate::prefs::load(c, u.id)?.vacation;
+                        let mfa = crate::identity::status(c, u.id)?;
                         out.push(j!({
                             "email": u.email, "quota_bytes": u.quota_bytes, "used_bytes": used,
                             "enabled": u.enabled, "admin": u.is_admin,
@@ -266,6 +276,8 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                             "addresses": addrs.into_iter().filter(|a| *a != u.email).collect::<Vec<_>>(),
                             "forwards_to": fwd,
                             "out_of_office": vac.active(store::now()),
+                            "mfa": mfa.enabled,
+                            "app_passwords": crate::identity::list_app_passwords(c, u.id)?.len(),
                         }));
                     }
                     Ok(Value::Array(out))
@@ -314,8 +326,13 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                     if store::find_user(c, &e2)?.is_none() {
                         bail!("no such user");
                     }
+                    let target = store::find_user(c, &e2)?.ok_or_else(|| anyhow!("no such user"))?;
                     if let Some(h) = hash {
                         store::set_password(c, &e2, &h)?;
+                        crate::identity::end_all_sessions(c, target.id)?;
+                    }
+                    if u.enabled == Some(false) {
+                        crate::identity::end_all_sessions(c, target.id)?;
                     }
                     if let Some(q) = u.quota_mb {
                         store::set_quota(c, &e2, q.max(0) * 1024 * 1024)?;
@@ -343,6 +360,62 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
             }
             crate::http::forget_cached_logins_for(&email);
             tracing::info!("admin {} deleted user {email}", me.email);
+            Ok(j!({ "ok": true }))
+        }
+
+        ("POST", ["users", email, "mfa-reset"]) => {
+            // For a user who has lost their phone and recovery codes. Also signs them out
+            // everywhere and removes their app passwords, so they start afresh.
+            let email = email.to_ascii_lowercase();
+            let e2 = email.clone();
+            srv.store
+                .call(move |c| {
+                    let u = store::find_user(c, &e2)?.ok_or_else(|| anyhow!("no such user"))?;
+                    crate::identity::disable(c, u.id)?;
+                    crate::identity::end_all_sessions(c, u.id)?;
+                    c.execute("DELETE FROM app_passwords WHERE user_id = ?1", [u.id])?;
+                    Ok(())
+                })
+                .await?;
+            crate::http::forget_cached_logins_for(&email);
+            tracing::warn!("admin {} reset two-factor authentication for {email}", me.email);
+            Ok(j!({ "ok": true }))
+        }
+
+        // ------------------------------------------------------------ delegations
+        ("GET", ["delegations"]) => {
+            let v = srv.store.call(|c| crate::identity::list_all(c)).await?;
+            Ok(serde_json::to_value(v)?)
+        }
+        ("POST", ["delegations"]) => {
+            #[derive(Deserialize)]
+            struct G {
+                owner: String,
+                grantee: String,
+                #[serde(default)]
+                mailbox: String,
+                #[serde(default)]
+                send: String,
+            }
+            let g: G = body(r)?;
+            let m = crate::identity::MailboxRight::parse(if g.mailbox.is_empty() { "none" } else { &g.mailbox })?;
+            let snd = crate::identity::SendRight::parse(if g.send.is_empty() { "none" } else { &g.send })?;
+            let (o, gr) = (g.owner.trim().to_ascii_lowercase(), g.grantee.trim().to_ascii_lowercase());
+            let (o2, g2) = (o.clone(), gr.clone());
+            srv.store.call(move |c| crate::identity::grant(c, &o2, &g2, m, snd)).await?;
+            tracing::info!("admin {} set access to {o} for {gr}: mailbox={} send={}", me.email, m.as_str(), snd.as_str());
+            Ok(j!({ "ok": true }))
+        }
+        ("DELETE", ["delegations"]) => {
+            let o = query(r, "owner").ok_or_else(|| anyhow!("owner missing"))?.to_ascii_lowercase();
+            let g = query(r, "grantee").ok_or_else(|| anyhow!("grantee missing"))?.to_ascii_lowercase();
+            let (o2, g2) = (o.clone(), g.clone());
+            srv.store
+                .call(move |c| {
+                    crate::identity::grant(c, &o2, &g2, crate::identity::MailboxRight::None, crate::identity::SendRight::None)
+                })
+                .await?;
+            tracing::info!("admin {} removed {g}'s access to {o}", me.email);
             Ok(j!({ "ok": true }))
         }
 

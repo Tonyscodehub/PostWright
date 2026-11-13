@@ -8,9 +8,17 @@ AMY = ("amy@poffles.test", "BatteryStaple2")
 def check(n, c, i=""):
     R.append(bool(c)); print(("PASS " if c else "FAIL ") + n + (f"  [{i}]" if i and not c else ""))
 
+TOKENS = {}
+def token(who):
+    if who not in TOKENS:
+        c = http.client.HTTPSConnection(H, 8443, context=ctx)
+        c.request("POST", "/api/v1/login", body=json.dumps({"email": who[0], "password": who[1], "kind": "app", "name": "admin_check"}), headers={"Content-Type": "application/json"})
+        r = c.getresponse(); TOKENS[who] = json.loads(r.read())["token"]; c.close()
+    return TOKENS[who]
+
 def req(method, path, who=TONY, body=None, xrw=True):
     c = http.client.HTTPSConnection(H, 8443, context=ctx)
-    h = {"Authorization": "Basic " + base64.b64encode(f"{who[0]}:{who[1]}".encode()).decode()}
+    h = {"Authorization": "Bearer " + token(who)}
     if xrw: h["X-Requested-With"] = "test"
     if body is not None:
         body = json.dumps(body); h["Content-Type"] = "application/json"
@@ -76,7 +84,7 @@ check("remove domain", s == 200, d)
 
 # Console page access
 c = http.client.HTTPSConnection(H, 8443, context=ctx)
-c.request("GET", "/admin", headers={"Authorization": "Basic " + base64.b64encode(b"amy@poffles.test:BatteryStaple2").decode()})
+c.request("GET", "/admin", headers={"Authorization": "Bearer " + token(AMY)})
 r = c.getresponse(); r.read()
 check("console page refused for non-admin", r.status == 403)
 print(f"\n{sum(R)}/{len(R)} passed"); sys.exit(0 if all(R) else 1)

@@ -9,6 +9,8 @@ One binary provides:
 - **IMAP4rev1** on 143 (STARTTLS) and 993 (TLS), with IDLE push, MOVE, UIDPLUS, and SPECIAL-USE
 - **CalDAV calendars with sharing** over HTTPS on 443
 - **Out-of-office auto-replies** and **server-stored signatures**
+- **Two-step verification** with any authenticator app (QR code set-up), plus app passwords and recovery codes
+- **Shared mailboxes and delegation**: open other people's mailboxes, and **send on behalf of** or **send as** them
 - **A settings web page and JSON API**, plus Thunderbird-style **autoconfig**
 - **An admin console**, both in the browser at `/admin` and as a Windows desktop app (**Postwright Admin**)
 - An **outbound queue** with MX failover, retries with back-off, and bounce reports
@@ -21,7 +23,8 @@ It works with Mailwright, Thunderbird, Apple Mail and Calendar, Outlook (IMAP), 
 
 - **No unauthenticated access to anything that matters.** Port 25 only accepts mail *for* domains hosted here (it can never be used as a relay), and offers no AUTH. Submission, IMAP, CalDAV, and the API all require a login.
 - **Credentials only travel encrypted.** SMTP AUTH is refused before STARTTLS (`538 5.7.11`), and IMAP advertises `LOGINDISABLED` until TLS is up. HTTP is HTTPS-only.
-- **No sender spoofing.** Authenticated users can only send as their own address or an alias that delivers to them, checked on both the envelope and the `From:` header.
+- **Two-step verification** (TOTP, RFC 6238) for every user who turns it on. Once it's on, the account password alone opens nothing: mail apps use app passwords, and Mailwright uses a revocable device token. See [Two-step verification](#two-step-verification).
+- **No sender spoofing.** Authenticated users can only send as their own address, an alias that delivers to them, or a mailbox they've been given send rights to. This is checked on both the envelope and the `From:` header.
 - **Passwords are hashed with Argon2id.** Logins take constant time whether or not the account exists, and concurrent hashing is bounded so a login flood can't exhaust memory.
 - **Brute-force protection.** After 5 failed logins in 15 minutes (configurable) an IP is blocked on every protocol.
 - **Connection limits.** These apply per listener and per IP, along with idle timeouts and line and literal size caps.
@@ -274,12 +277,75 @@ postwright calendar list amy@example.co.uk
 
 Each calendar can also be downloaded as a single `.ics` with `GET` on its URL.
 
+## Two-step verification
+
+Each user turns it on themselves from their settings page (`https://mail.example.com/`):
+
+1. Click **Set up an authenticator app** and scan the QR code with Microsoft Authenticator, Google Authenticator, Authy, 1Password, Bitwarden, or any other TOTP app. The key is also shown as text for apps that can't scan.
+2. Type the 6-digit code to confirm. Nothing changes until this step succeeds, so a mis-scan can't lock anyone out.
+3. Save the 10 **recovery codes** it shows. Each one works once in place of a code if the phone is lost. A fresh set can be made at any time.
+
+After that:
+
+| Where | How you sign in |
+|---|---|
+| Settings page, admin console | Password, then a code from the app |
+| Postwright Admin (desktop) | Password, then a code from the app |
+| Mailwright | Password and code once; it then keeps a device token (see below) |
+| Outlook, Thunderbird, phone mail apps, calendar apps | An **app password** made on the settings page. The account password no longer works for IMAP, SMTP or CalDAV. |
+
+**App passwords** look like `abcd-efgh-jkmn-pqrs`. Make one per app, so a lost laptop can be cut off without changing anything else. The settings page shows when each was last used. They can't be used to sign in to the web pages.
+
+**Signed-in browsers and apps** are listed on the settings page, and any of them can be signed out. Web sessions expire after 12 hours idle (7 days at most). Changing your password, turning on two-step verification, or an admin reset signs out everything else.
+
+**Lost phone and recovery codes?** An administrator resets it from the console (Users → Edit → *Reset two-step verification*), the desktop app, or `postwright user mfa-reset <email>`. That also signs the user out everywhere and removes their app passwords, so they start clean.
+
+To insist that administrators use it, set `require_mfa_for_admins = true` under `[security]`: the console and admin API then refuse admins who haven't turned it on.
+
+Codes are checked with ±30 seconds of clock drift allowed, and each code can be used only once. Secrets are generated on the server and never leave it after set-up. Recovery codes and app passwords are stored only as hashes.
+
+### Mailwright token sign-in
+
+Mailwright can sign in once with the password and code, then use a long-lived **device token** for IMAP, SMTP and CalDAV, so the user never needs an app password for it:
+
+1. `POST /api/v1/login` with `{"email", "password", "code", "kind": "device", "name": "Mailwright on LAPTOP"}`.
+   - If two-step verification is on and no code was sent, the reply is `401 {"mfa_required": true}`: ask for the code and send again.
+   - On success the reply contains `{"token": "..."}`. Store it in the OS credential store.
+2. Sign in to IMAP and SMTP with SASL **OAUTHBEARER** (RFC 7628) or **XOAUTH2**, using the token as the bearer token. Both are advertised once TLS is up. CalDAV and the settings API accept `Authorization: Bearer <token>`.
+3. The token stays valid while it's used at least once every 90 days. It appears on the user's *Signed-in browsers and apps* list, where it can be revoked, and it stops working after a password change or an admin reset. When IMAP or SMTP rejects it, sign in again from step 1.
+
+## Shared mailboxes and send on behalf
+
+An administrator can let one user into another's mailbox, and separately let them send from it. Use the console's **Mailbox access** page, the desktop app, or:
+
+```sh
+postwright delegate grant amy@example.com tony@example.com --mailbox full --send on-behalf
+postwright delegate list
+postwright delegate revoke amy@example.com tony@example.com
+```
+
+**Mailbox access:**
+
+- **Read only:** read and search everything, but change nothing. Opening mail doesn't mark it as read for the owner.
+- **Full access:** also flag, file, delete, and add mail.
+
+The mailbox appears in the user's mail app under **Other Users/amy@example.com/** (announced through IMAP NAMESPACE, so Thunderbird, Outlook and Mailwright show it as a separate tree). Changes show up in the owner's apps straight away. Only the owner can create, rename or delete folders. Every time someone opens another person's folder, it's written to the log.
+
+**Sending:**
+
+- **Send on behalf:** Tony can put `From: Amy` on a message. Postwright adds `Sender: tony@example.com` (replacing any `Sender:` the app wrote), so recipients see "Tony on behalf of Amy". This is the usual choice for assistants.
+- **Send as:** the message looks exactly as if Amy had sent it. Use it for shared addresses like a team mailbox.
+
+In both cases the message is DKIM-signed for Amy's domain, so it passes DMARC. Users can see what's been shared with them on their settings page.
+
 ## Settings API
 
-All endpoints use HTTP Basic auth (email and password) over HTTPS. State-changing calls must send `Content-Type: application/json`.
+Sign in with `POST /api/v1/login` (`kind: "web"` sets a session cookie; `"app"` or `"device"` returns a bearer token). All other endpoints need that cookie or `Authorization: Bearer <token>`. HTTP Basic auth is only accepted for CalDAV. State-changing calls must send `Content-Type: application/json`.
 
 | Method | Path | Purpose |
 |---|---|---|
+| POST | `/api/v1/login` | `{ email, password, code?, kind, name? }`. Returns `401 {mfa_required: true}` when a code is needed |
+| POST | `/api/v1/logout` | End this session |
 | GET | `/api/v1/me` | Account, quota, and connection settings |
 | GET / PUT | `/api/v1/settings` | `{ vacation: {enabled, subject, body, start, end, internal_only}, signature: {text, html, append} }` |
 | POST | `/api/v1/password` | `{ current, new }` |
@@ -287,6 +353,16 @@ All endpoints use HTTP Basic auth (email and password) over HTTPS. State-changin
 | DELETE | `/api/v1/calendars/{slug}` | Delete (owner) or leave (sharee) |
 | POST | `/api/v1/calendars/{slug}/shares` | `{ user, write }` |
 | DELETE | `/api/v1/calendars/{slug}/shares/{user}` | Stop sharing |
+| GET | `/api/v1/mfa` | Two-step verification status |
+| POST | `/api/v1/mfa/setup` | Start set-up: returns `{ secret, uri, qr_svg }` |
+| POST | `/api/v1/mfa/confirm` | `{ code }`. Turns it on and returns `{ recovery_codes }` |
+| POST | `/api/v1/mfa/recovery-codes` | `{ code }`. Replaces the recovery codes |
+| POST | `/api/v1/mfa/disable` | `{ password, code }` |
+| GET / POST | `/api/v1/app-passwords` | List, or create `{ name }` (the password is returned once) |
+| DELETE | `/api/v1/app-passwords/{id}` | Remove an app password |
+| GET | `/api/v1/devices` | Signed-in browsers and apps |
+| DELETE | `/api/v1/devices/{id}` | Sign one out |
+| GET | `/api/v1/shared` | Mailboxes shared with me, and my send rights |
 
 ## Administration
 
@@ -301,13 +377,14 @@ postwright user admin tony@example.com
 Then use either:
 
 - **Web console:** `https://mail.example.com/admin`, which works in any browser.
-- **Postwright Admin:** the Windows desktop app (`postwright-admin.exe`). Sign in with the server name, your email, and your password. If the server uses a self-signed certificate, the app shows its SHA-256 fingerprint and asks you to trust it once. After that it only accepts that exact certificate. When the certificate is renewed, the app either notices it's now publicly trusted and stops pinning, or shows the new fingerprint for you to check. Your password is never saved.
+- **Postwright Admin:** the Windows desktop app (`postwright-admin.exe`). Sign in with the server name, your email, and your password (and a code, if you use two-step verification). If the server uses a self-signed certificate, the app shows its SHA-256 fingerprint and asks you to trust it once. After that it only accepts that exact certificate. When the certificate is renewed, the app either notices it's now publicly trusted and stops pinning, or shows the new fingerprint for you to check. Your password is never saved.
 
 Both offer the same tools:
 
 - **Overview:** counts, storage, scanner health, and the server's DNS and reverse DNS.
 - **Domains:** add a domain (DKIM key generated), add an alias domain, set a catch-all, and remove a domain. A live DNS check shows each MX, SPF, DKIM, and DMARC record to publish, whether it's live, and a copy button.
-- **Users:** search, add, set quotas, reset passwords, enable or disable, and grant admin rights. Shows usage, out-of-office status, and imported passwords.
+- **Users:** search, add, set quotas, reset passwords, enable or disable, grant admin rights, and reset two-step verification. Shows usage, out-of-office, two-step status, and imported passwords.
+- **Mailbox access:** who can open whose mailbox (read only or full), and who can send on behalf of or as whom.
 - **Aliases:** add and remove.
 - **Mail queue:** see retries and errors, retry now, or delete a message.
 - **Spam and antivirus:** thresholds, blocklists, and whether each scanner is responding.
@@ -328,7 +405,8 @@ Both offer the same tools:
 postwright domain   add | alias | list | remove | dns | catch-all
 postwright cert     status | key-add | key-list | key-remove | install
 postwright import   iredmail
-postwright user     add | passwd | list | remove | disable | enable | admin | vacation | signature
+postwright user     add | passwd | list | remove | disable | enable | admin | mfa-reset | vacation | signature
+postwright delegate grant | revoke | list
 postwright alias    add | remove | list
 postwright calendar list | create | share | unshare
 postwright queue    list | flush

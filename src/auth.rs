@@ -95,8 +95,66 @@ fn hash_slots() -> &'static tokio::sync::Semaphore {
     S.get_or_init(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)))
 }
 
-/// Check credentials. Runs Argon2 on the blocking pool.
+/// Sign-in for mail apps and calendars (IMAP, SMTP, CalDAV): an app password always
+/// works; the account password works only while two-factor authentication is off.
 pub async fn authenticate(store: &Store, email: &str, password: &str) -> Result<Option<User>> {
+    let (e, p) = (email.trim().to_ascii_lowercase(), password.to_string());
+    let via_app = store
+        .call(move |c| {
+            let Some(u) = store::find_user(c, &e)? else { return Ok(Err(false)) };
+            if !u.enabled {
+                return Ok(Err(false));
+            }
+            if crate::identity::check_app_password(c, u.id, &p)? {
+                return Ok(Ok(u));
+            }
+            Ok(Err(crate::identity::enabled(c, u.id)?))
+        })
+        .await?;
+    match via_app {
+        Ok(u) => Ok(Some(u)),
+        Err(true) => {
+            // 2FA is on: the account password isn't accepted here. Still spend the
+            // same time so this can't be used to probe which accounts have 2FA.
+            let _ = verify_password(store, "", password).await;
+            Ok(None)
+        }
+        Err(false) => verify_password(store, email, password).await,
+    }
+}
+
+pub enum WebLogin {
+    Ok(User),
+    /// Password right; a code from the authenticator app (or a recovery code) is needed.
+    NeedCode,
+    Fail,
+}
+
+/// Sign-in for the web pages and admin app: account password, plus a code when 2FA is on.
+pub async fn web_login(store: &Store, email: &str, password: &str, code: Option<&str>) -> Result<WebLogin> {
+    let Some(u) = verify_password(store, email, password).await? else { return Ok(WebLogin::Fail) };
+    let code = code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    let id = u.id;
+    let res = store
+        .call(move |c| {
+            if !crate::identity::enabled(c, id)? {
+                return Ok(Some(true));
+            }
+            match code {
+                None => Ok(None),
+                Some(code) => Ok(Some(crate::identity::verify_code(c, id, &code)?)),
+            }
+        })
+        .await?;
+    Ok(match res {
+        Some(true) => WebLogin::Ok(u),
+        None => WebLogin::NeedCode,
+        Some(false) => WebLogin::Fail,
+    })
+}
+
+/// Check the account password itself. Runs Argon2 on the blocking pool.
+pub async fn verify_password(store: &Store, email: &str, password: &str) -> Result<Option<User>> {
     if password.len() > 1024 || email.len() > 320 {
         return Ok(None);
     }
@@ -128,6 +186,42 @@ pub async fn authenticate(store: &Store, email: &str, password: &str) -> Result<
 }
 
 /// Decode a SASL PLAIN response: authzid \0 authcid \0 passwd.
+/// `{"status":"invalid_token"}` base64-encoded, the RFC 7628 failure challenge.
+pub const BEARER_ERROR_B64: &str = "eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIn0=";
+
+/// Decode an OAUTHBEARER (RFC 7628) or XOAUTH2 initial response into (user, token).
+pub fn decode_bearer(b64: &str) -> Option<(Option<String>, String)> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
+    let s = String::from_utf8(raw).ok()?;
+    let mut user = None;
+    let mut token = None;
+    for part in s.split('\x01') {
+        if let Some(gs2) = part.strip_prefix("n,").or_else(|| part.strip_prefix("y,")) {
+            // GS2 header: n,a=user@example.com,
+            for f in gs2.split(',') {
+                if let Some(a) = f.strip_prefix("a=") {
+                    user = Some(a.replace("=2C", ",").replace("=3D", "="));
+                }
+            }
+        } else if let Some(u) = part.strip_prefix("user=") {
+            user = Some(u.to_string());
+        } else if let Some(a) = part.strip_prefix("auth=") {
+            let t = a.strip_prefix("Bearer ").or_else(|| a.strip_prefix("bearer "))?;
+            token = Some(t.trim().to_string());
+        }
+    }
+    Some((user.filter(|u| !u.is_empty()), token?))
+}
+
+/// Sign in to IMAP/SMTP/CalDAV with a device token. If the client also names a user it
+/// must match the token's owner.
+pub async fn token_login(store: &Store, who: Option<&str>, token: &str) -> Result<Option<User>> {
+    let t = token.to_string();
+    let u = store.call(move |c| crate::identity::session_user(c, &t, &["device"])).await?;
+    Ok(u.filter(|u| who.map(|w| w.eq_ignore_ascii_case(&u.email)).unwrap_or(true)))
+}
+
 pub fn decode_plain(b64: &str) -> Option<(String, String)> {
     let raw = base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok()?;
     let mut parts = raw.split(|&b| b == 0);
