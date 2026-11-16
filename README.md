@@ -90,7 +90,7 @@ The wizard walks through each step in order, checking as it goes:
 8. **Bring mail across** from Microsoft 365, Google, Exchange, IMAP or files (see [Migrations](#migrations)).
 9. **Finish:** installs Postwright as a **service that starts automatically at boot** (a Windows service, or a systemd service on Linux) and restarts itself if it ever stops, then hands over to it and takes you to the sign-in page.
 
-The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. Once an administrator exists and setup is finished, it's gone.
+The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. If Postwright is running as a service, the code is in `setup-code.txt` and `postwright.log` next to the settings file. Once an administrator exists and setup is finished, it's gone.
 
 Everything can also be done from the command line, for scripting:
 
@@ -528,7 +528,7 @@ postwright service stop | start
 postwright service uninstall
 ```
 
-The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
+On Windows, `service install` also adds Windows Firewall rules for ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network (`service uninstall` removes them). The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
 
 ## Not yet included
 

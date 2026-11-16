@@ -32,7 +32,6 @@ pub fn log_to_file(path: &std::path::Path) {
     }
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn write_line(line: &str) {
     let _ = Tee.write_all(format!("{} {line}\n", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")).as_bytes());
 }

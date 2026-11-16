@@ -230,6 +230,11 @@ pub async fn run(path: &Path) -> Result<()> {
         ips.iter().map(|ip| format!("     https://{ip}{suffix}/setup#{}\n", st.code)).collect::<String>(),
         st.code
     );
+    // Also into the log and a file next to the settings, because a Windows service
+    // has no console to print to.
+    crate::logbuf::write_line(&format!("SETUP: open {first} (setup code {})", st.code));
+    let code_file = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join("setup-code.txt");
+    let _ = std::fs::write(&code_file, format!("Postwright setup\r\n\r\nOpen: {first}\r\n{}\r\nSetup code: {}\r\n", ips.iter().map(|ip| format!("  or: https://{ip}{suffix}/setup#{}\r\n", st.code)).collect::<String>(), st.code));
     println!("{banner}");
     tracing::info!("setup wizard waiting on port {port}");
     open_browser(&first);
@@ -242,6 +247,7 @@ pub async fn run(path: &Path) -> Result<()> {
         h.abort();
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = std::fs::remove_file(&code_file);
     println!("\n  Setup finished: starting Postwright.\n");
     Ok(())
 }

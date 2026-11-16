@@ -105,9 +105,26 @@ mod win {
             ]),
         });
         let _ = svc.set_failure_actions_on_non_crash_failures(true);
+        let fw = firewall();
         // The scheduled task used by earlier versions isn't needed any more.
         let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", "Postwright", "/F"]).output();
-        Ok(format!("Windows service \"{NAME}\": starts automatically at boot and restarts if it stops. It runs {} with {}.", exe.display(), cfg.display()))
+        Ok(format!("Windows service \"{NAME}\": starts automatically at boot and restarts if it stops. It runs {} with {}. {fw}", exe.display(), cfg.display()))
+    }
+
+    /// Windows Firewall rules for the mail ports (2222 for certificate pushes only from
+    /// the admin networks' gateway range). Replaces any earlier Postwright rules.
+    fn firewall() -> String {
+        let netsh = |args: &[&str]| std::process::Command::new("netsh").args(args).output().map(|o| o.status.success()).unwrap_or(false);
+        for name in ["Postwright mail", "Postwright cert push"] {
+            let _ = netsh(&["advfirewall", "firewall", "delete", "rule", &format!("name={name}")]);
+        }
+        let a = netsh(&["advfirewall", "firewall", "add", "rule", "name=Postwright mail", "dir=in", "action=allow", "protocol=TCP", "localport=25,465,587,143,993,443"]);
+        let b = netsh(&["advfirewall", "firewall", "add", "rule", "name=Postwright cert push", "dir=in", "action=allow", "protocol=TCP", "localport=2222", "remoteip=localsubnet"]);
+        if a && b {
+            "Windows Firewall now allows ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network.".into()
+        } else {
+            "Couldn't add the Windows Firewall rules; allow ports 25, 465, 587, 143, 993, 443 and 2222 (local network) yourself.".into()
+        }
     }
 
     pub fn uninstall() -> Result<String> {
@@ -125,6 +142,9 @@ mod win {
             }
         }
         svc.delete().map_err(denied)?;
+        for name in ["Postwright mail", "Postwright cert push"] {
+            let _ = std::process::Command::new("netsh").args(["advfirewall", "firewall", "delete", "rule", &format!("name={name}")]).output();
+        }
         Ok(format!("Windows service \"{NAME}\" removed"))
     }
 
