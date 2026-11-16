@@ -528,7 +528,9 @@ postwright service stop | start
 postwright service uninstall
 ```
 
-On Windows, `service install` also adds Windows Firewall rules for ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network (`service uninstall` removes them). The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
+On Windows, `service install` also adds Windows Firewall rules for ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network (`service uninstall` removes them). **Upgrading on Windows:** unzip the new version into a folder of its own and double-click its `postwright.exe`. It finds the previous version's settings (from the installed service, a neighbouring version folder, or `C:\ProgramData\Postwright`) and carries on with the same mail and data, which aren't moved. If the service is running the older version, it offers to switch the service to the new one.
+
+The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
 
 ## Not yet included
 

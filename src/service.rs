@@ -199,6 +199,30 @@ mod win {
         Ok(())
     }
 
+    /// The installed service's command line: (program, settings file).
+    fn installed() -> Option<(PathBuf, Option<PathBuf>)> {
+        let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+        let svc = mgr.open_service(NAME, ServiceAccess::QUERY_CONFIG).ok()?;
+        let line = svc.query_config().ok()?.executable_path.display().to_string();
+        let (exe, rest) = if let Some(r) = line.strip_prefix('"') {
+            let (e, rest) = r.split_once('"')?;
+            (e.to_string(), rest.to_string())
+        } else {
+            let i = line.to_ascii_lowercase().find(".exe").map(|i| i + 4).unwrap_or(line.len());
+            (line[..i].to_string(), line[i..].to_string())
+        };
+        let cfg = rest.split_once("-c ").map(|(_, c)| PathBuf::from(c.trim().trim_matches('"')));
+        Some((PathBuf::from(exe), cfg))
+    }
+
+    pub fn installed_exe() -> Option<PathBuf> {
+        installed().map(|x| x.0)
+    }
+
+    pub fn installed_config() -> Option<PathBuf> {
+        installed().and_then(|x| x.1)
+    }
+
     static CONFIG: OnceLock<PathBuf> = OnceLock::new();
 
     define_windows_service!(ffi_service_main, service_main);
@@ -319,7 +343,16 @@ mod nix {
 }
 
 #[cfg(windows)]
-pub use win::{dispatch, install, start, state, stop, uninstall};
+pub use win::{dispatch, install, installed_config, installed_exe, start, state, stop, uninstall};
+
+#[cfg(not(windows))]
+pub fn installed_config() -> Option<PathBuf> {
+    None
+}
+#[cfg(not(windows))]
+pub fn installed_exe() -> Option<PathBuf> {
+    None
+}
 #[cfg(unix)]
 pub use nix::{install, start, state, stop, uninstall};
 

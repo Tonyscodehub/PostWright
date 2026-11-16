@@ -19,6 +19,7 @@ mod prefs;
 mod server;
 mod service;
 mod setup;
+mod upgrade;
 mod smtp;
 mod store;
 mod xml;
@@ -53,7 +54,16 @@ fn config_path(given: Option<PathBuf>) -> PathBuf {
         return here;
     }
     // Double-clicked on Windows: keep everything next to the program.
-    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("postwright.toml"))).unwrap_or(here)
+    let mine = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("postwright.toml"))).unwrap_or(here);
+    if !mine.exists() {
+        if let Some(prev) = upgrade::find_previous(&mine) {
+            match upgrade::adopt(&prev, &mine) {
+                Ok(()) => println!("\nFound the settings of a previous version at {}.\nThis version uses them, and the same mail and data: nothing has been moved.\n", prev.display()),
+                Err(e) => eprintln!("Found earlier settings at {} but couldn't use them: {e:#}", prev.display()),
+            }
+        }
+    }
+    mine
 }
 
 #[derive(Subcommand)]
@@ -397,6 +407,9 @@ fn real_main() -> Result<()> {
     }
     if let Cmd::Serve = cmd {
         // Double-clicked while the service is already running: don't fight it for the ports.
+        if interactive_start() && service::state() == service::State::Running && upgrade::offer_service_upgrade(&path)? {
+            return Ok(());
+        }
         if interactive_start() && service::state() == service::State::Running {
             let url = "https://localhost/admin";
             println!("\nPostwright is already running as a service (it starts automatically at boot).\nOpen {url} to manage it, or use Services (services.msc) to stop it.\n");
