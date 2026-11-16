@@ -88,7 +88,7 @@ The wizard walks through each step in order, checking as it goes:
 6. **Spam and viruses:** ClamAV, Rspamd and SpamAssassin are found automatically if they're running.
 7. **DNS records:** each record to publish, with copy buttons and a live check.
 8. **Bring mail across** from Microsoft 365, Google, Exchange, IMAP or files (see [Migrations](#migrations)).
-9. **Finish:** optionally install it to start at boot (a systemd service on Linux, a background task on Windows), then it starts and takes you to the sign-in page.
+9. **Finish:** installs Postwright as a **service that starts automatically at boot** (a Windows service, or a systemd service on Linux) and restarts itself if it ever stops, then hands over to it and takes you to the sign-in page.
 
 The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. Once an administrator exists and setup is finished, it's gone.
 
@@ -484,6 +484,7 @@ Both offer the same tools:
 ```text
 postwright domain   add | alias | list | remove | dns | catch-all
 postwright cert     status | key-add | key-list | key-remove | install
+postwright service  install | uninstall | start | stop | status
 postwright migrate  run | discover | files
 postwright import   iredmail
 postwright user     add | passwd | list | remove | disable | enable | admin | mfa-reset | vacation | signature
@@ -517,7 +518,17 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 ## Deployment
 
 - **Linux:** the release binary is fully static (musl), so it runs on any x86-64 distribution. See `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
-- **Windows:** run `postwright.exe` as administrator; the setup wizard's last step can make it start automatically with Windows (as a background task that runs without anyone signed in). Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
+- **Windows:** run `postwright.exe` as administrator; the setup wizard's last step installs it as a Windows service (**Postwright mail server** in Services) that starts at boot, before anyone signs in, and restarts itself after a failure. Its log is `postwright.log` next to the settings file. Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
+- **Both:** the service can also be managed from the command line:
+
+```sh
+postwright service install --start    # install (or update) and start; starts at every boot
+postwright service status
+postwright service stop | start
+postwright service uninstall
+```
+
+The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
 
 ## Not yet included
 

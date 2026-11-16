@@ -17,6 +17,7 @@ mod admin;
 mod net;
 mod prefs;
 mod server;
+mod service;
 mod setup;
 mod smtp;
 mod store;
@@ -102,6 +103,12 @@ enum Cmd {
     Migrate {
         #[command(subcommand)]
         cmd: MigrateCmd,
+    },
+    /// Run Postwright as a service that starts automatically at boot (Windows service,
+    /// or systemd on Linux).
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
     },
     /// Let one user open another's mailbox and/or send from their address.
     Delegate {
@@ -265,6 +272,24 @@ enum CalendarCmd {
 }
 
 #[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install (or update) the service and set it to start at boot.
+    Install {
+        /// Also start it now.
+        #[arg(long)]
+        start: bool,
+    },
+    /// Stop and remove the service.
+    Uninstall,
+    Start,
+    Stop,
+    Status,
+    /// Used by the Windows service manager to run the service.
+    #[command(hide = true)]
+    Run,
+}
+
+#[derive(Subcommand)]
 enum MigrateCmd {
     /// Run a migration described in a JSON file (see README). Safe to run again: only
     /// new items are copied.
@@ -327,6 +352,42 @@ fn main() -> Result<()> {
     r
 }
 
+fn interactive_start() -> bool {
+    std::env::args().len() == 1
+}
+
+fn service_cmd(path: &Path, cmd: &ServiceCmd) -> Result<()> {
+    match cmd {
+        ServiceCmd::Install { start } => {
+            if !path.exists() {
+                bail!("{} doesn't exist yet: run postwright on its own first to go through setup", path.display());
+            }
+            println!("{}", service::install(path)?);
+            if *start {
+                service::start()?;
+                println!("Started.");
+            }
+        }
+        ServiceCmd::Uninstall => println!("{}", service::uninstall()?),
+        ServiceCmd::Start => {
+            service::start()?;
+            println!("Started.");
+        }
+        ServiceCmd::Stop => {
+            service::stop()?;
+            println!("Stopped.");
+        }
+        ServiceCmd::Status => println!("{}", service::state().describe()),
+        ServiceCmd::Run => {
+            #[cfg(windows)]
+            return service::dispatch(std::path::absolute(path)?);
+            #[cfg(not(windows))]
+            bail!("\"service run\" is only used on Windows; on Linux systemd runs \"postwright serve\"");
+        }
+    }
+    Ok(())
+}
+
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(cli.config);
@@ -335,7 +396,22 @@ fn real_main() -> Result<()> {
         return init(&path, hostname, data_dir);
     }
     if let Cmd::Serve = cmd {
+        // Double-clicked while the service is already running: don't fight it for the ports.
+        if interactive_start() && service::state() == service::State::Running {
+            let url = "https://localhost/admin";
+            println!("\nPostwright is already running as a service (it starts automatically at boot).\nOpen {url} to manage it, or use Services (services.msc) to stop it.\n");
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+                println!("Press Enter to close.");
+                let _ = std::io::stdin().read_line(&mut String::new());
+            }
+            return Ok(());
+        }
         return serve(&path);
+    }
+    if let Cmd::Service { cmd } = &cmd {
+        return service_cmd(&path, cmd);
     }
     let cfg = Config::load(&path).map_err(|e| {
         if !path.exists() {
@@ -345,7 +421,7 @@ fn real_main() -> Result<()> {
         }
     })?;
     match cmd {
-        Cmd::Serve => unreachable!(),
+        Cmd::Serve | Cmd::Service { .. } => unreachable!(),
         Cmd::Domain { cmd } => domain_cmd(&cfg, cmd),
         Cmd::User { cmd } => user_cmd(&cfg, cmd),
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
@@ -829,7 +905,7 @@ fn queue_cmd(cfg: &Config, cmd: QueueCmd) -> Result<()> {
     Ok(())
 }
 
-fn serve(path: &Path) -> Result<()> {
+pub fn serve(path: &Path) -> Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(|| logbuf::Tee)
@@ -879,7 +955,10 @@ fn serve(path: &Path) -> Result<()> {
             });
         }
         tracing::info!("Postwright {} running as {}", env!("CARGO_PKG_VERSION"), srv.cfg.hostname);
-        tokio::signal::ctrl_c().await?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r?,
+            _ = service::STOP.notified() => {}
+        }
         tracing::info!("shutting down");
         Ok(())
     })

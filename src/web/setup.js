@@ -323,48 +323,58 @@ async function migrateStep() {
 async function finish() {
   const st = await api("GET", "migrate/status");
   const migrating = st.progress.running;
+  const win = S.platform === "windows";
+  const canService = S.service_supported;
   const issues = [];
   if (!S.admins.length) issues.push("Create an administrator account (step 5).");
   if (!S.domains.length) issues.push("Add at least one domain (step 4).");
-  const svcOut = h("div");
-  let installed = false;
-  const svcBtn = h("button", { class: "ghost", onclick: async (e) => {
-    const r = await busy(e.target, () => api("POST", "service", {}));
-    if (r) { installed = true; svcOut.replaceChildren(pill("Installed", "ok"), " ", r.how); startSvc.disabled = migrating; }
-  } }, S.platform === "windows" ? "Start automatically with Windows" : "Install as a system service");
-  const done = async (useService, btn) => {
-    const r = await busy(btn, () => api("POST", "finish", { start_service: useService }));
+  const asService = h("input", { type: "checkbox", checked: canService, disabled: !canService });
+  const done = async (btn) => {
+    let handOver = false;
+    if (asService.checked) {
+      const r = await busy(btn, () => api("POST", "service", {}));
+      if (!r) return;
+      toast("Installed: " + r.how, true);
+      handOver = !migrating;
+    }
+    const r = await busy(btn, () => api("POST", "finish", { start_service: handOver }));
     if (!r) return;
     ["pw-step", "pw-from", "pw-host-ok", "pw-cert-ok", "pw-spam-ok", "pw-dns-ok", "pw-migrate-ok", "pw-setup-code"].forEach((k) => sessionStorage.removeItem(k));
-    main.replaceChildren(h("div", { class: "center" }, h("h2", {}, "Starting Postwright…"), h("p", { class: "lead" }, "You'll be taken to the sign-in page in a moment.")));
     document.getElementById("steps").replaceChildren();
+    main.replaceChildren(h("div", { class: "center" }, h("h2", {}, handOver ? "Starting the Postwright service…" : "Starting Postwright…"),
+      h("p", { class: "lead" }, handOver ? "This window's copy closes and the service takes over. You'll be taken to the sign-in page in a moment." : "You'll be taken to the sign-in page in a moment.")));
     // The running server may present a different temporary certificate from the one
     // this page was opened with, which background requests can't get past. So wait,
     // then navigate: the browser then shows its warning page if it needs to.
-    await new Promise((res) => setTimeout(res, useService ? 9000 : 5000));
+    await new Promise((res) => setTimeout(res, handOver ? 10000 : 5000));
     main.replaceChildren(h("div", { class: "center" }, h("h2", {}, "Postwright is running"),
       h("p", { class: "lead" }, "If your browser warns about the certificate again, that's the temporary one made for your server name: continue to the page."),
       h("p", {}, h("a", { href: "/login?next=%2Fadmin" }, "Go to the sign-in page"))));
     location.replace("/login?next=%2Fadmin");
   };
-  const startHere = h("button", { disabled: issues.length > 0, onclick: (e) => done(false, e.target) }, "Finish and start Postwright");
-  const startSvc = h("button", { disabled: true, onclick: (e) => done(true, e.target) }, "Finish and start the service");
+  const why = !canService
+    ? (win ? "To install the service, close this window and start postwright.exe again with right-click → Run as administrator. Setup carries on where you left off."
+           : S.platform === "linux" && !S.is_root ? "To install the service, stop Postwright and start it again with sudo."
+           : "This system doesn't use systemd, so start Postwright from your init system.")
+    : migrating ? "A migration is running in this window, so the service is installed now but takes over at the next restart." : null;
   page("Ready to go", "Postwright will start its mail services now.",
     issues.length ? h("div", { class: "card note" }, h("b", {}, "Before you finish:"), h("ul", {}, issues.map((i) => h("li", {}, i)))) : null,
-    h("div", { class: "card" }, h("h3", {}, "Keep it running"),
-      h("p", {}, S.platform === "windows"
-        ? "Have Postwright start in the background whenever Windows starts, even when nobody is signed in. Needs Postwright to have been started with \"Run as administrator\"."
-        : "Install Postwright as a systemd service so it starts at boot and restarts if it stops."),
-      h("div", { class: "row" }, svcBtn, svcOut),
-      migrating ? h("p", { class: "muted small" }, "A migration is running in this window, so the service will take over at the next restart instead of now.") : null),
+    h("div", { class: "card" }, h("h3", {}, "Start automatically"),
+      h("label", { class: "check" }, asService, h("div", {},
+        h("b", {}, win ? "Install as a Windows service" : "Install as a system service (systemd)"),
+        h("div", { class: "muted" }, win
+          ? "Starts when Windows starts, before anyone signs in, and restarts itself if it ever stops. Manage it under Services (services.msc) as \"Postwright mail server\"."
+          : "Starts at boot and restarts itself if it ever stops. Manage it with systemctl (status, stop, start postwright)."))),
+      S.service && S.service !== "not installed" ? h("p", { class: "muted small" }, "Currently: " + S.service) : null,
+      why ? h("p", { class: canService ? "muted small" : "" }, why) : null,
+      h("p", { class: "muted small" }, "Postwright runs from ", h("code", {}, S.exe || ""), " with the settings in ", h("code", {}, S.config_path), ". Keep that folder where it is.")),
     h("div", { class: "card" }, h("h3", {}, "After you finish"),
       h("ol", { class: "steps" },
         h("li", {}, "Sign in to the admin console with your administrator account."),
         h("li", {}, "Under My settings, turn on two-step verification."),
         h("li", {}, "Set up your mail app: server ", h("b", {}, S.hostname), ", IMAP 993 and SMTP 465, both SSL/TLS, with your full email address."),
         migrateFrom === "other" || migrateFrom === "iredmail" ? h("li", {}, "When the mail has been copied, change your MX records, then run the migration again to catch up.") : null)),
-    navRow(startHere, startSvc));
-  void installed;
+    navRow(h("button", { disabled: issues.length > 0, onclick: (e) => done(e.target) }, "Finish and start Postwright")));
 }
 
 // --------------------------------------------------------------------- go

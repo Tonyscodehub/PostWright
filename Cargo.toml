@@ -1,6 +1,6 @@
 [package]
 name = "postwright"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 description = "Secure, multi-domain SMTP + IMAP mail server written in Rust"
 license = "MIT"
@@ -60,3 +60,6 @@ strip = true
 
 [workspace]
 members = [".", "admin"]
+
+[target."cfg(windows)".dependencies]
+windows-service = "0.8"

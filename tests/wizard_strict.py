@@ -38,10 +38,13 @@ with sync_playwright() as pw:
     for _ in range(5):
         page.click("button:has-text('Continue'), button:has-text('Save and continue'), button:has-text('Skip')"); page.wait_for_timeout(2500)
     check("reached the finish step", page.is_visible("text=Ready to go"), page.inner_text("main")[:200])
-    page.click("text=Finish and start Postwright"); page.wait_for_timeout(8000)
+    svc = page.is_enabled("input[type=checkbox]") and page.is_checked("input[type=checkbox]")
+    print("service checkbox ticked by default:", svc)
+    page.click("text=Finish and start Postwright"); page.wait_for_timeout(14000)
     check("browser sent on to the sign-in page", "/login" in page.url, page.url)
     b.close()
 log = open("/tmp/wiz/out.log").read()
-check("server started normally", "running as mail.throwaway.test" in log, log[-500:])
+svclog = open("/tmp/wiz/postwright.log").read() if os.path.exists("/tmp/wiz/postwright.log") else ""
+check("server started normally", "running as mail.throwaway.test" in log + svclog, (log + svclog)[-500:])
 p.terminate()
 print(f"\n{sum(R)}/{len(R)} passed"); sys.exit(0 if all(R) else 1)

@@ -389,7 +389,10 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
             reload(st)?;
             Ok(json!({ "ok": true }))
         }
-        ("POST", ["service"]) => install_service(&st.path),
+        ("POST", ["service"]) => {
+            let how = crate::service::install(&st.path)?;
+            Ok(json!({ "ok": true, "how": how }))
+        }
         ("POST", ["finish"]) => {
             let b = body(r)?;
             let admins: i64 = srv.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM users WHERE is_admin = 1", [], |r| r.get(0))?)).await?;
@@ -403,7 +406,7 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 st2.finished.store(true, std::sync::atomic::Ordering::Relaxed);
                 if use_service {
-                    hand_over_to_service();
+                    crate::service::hand_over();
                 }
                 st2.done.notify_one();
             });
@@ -462,6 +465,8 @@ async fn state(st: &Arc<State>, srv: &Shared) -> Result<Value> {
         "iredmail_detected": iredmail,
         "admin_networks": srv.cfg.security.admin_networks,
         "listeners": srv.cfg.listeners.https,
+        "service": crate::service::state().describe(),
+        "service_supported": is_root() && (cfg!(windows) || Path::new("/run/systemd/system").exists()),
     }))
 }
 
@@ -477,69 +482,3 @@ fn is_root() -> bool {
     }
 }
 
-fn install_service(config: &Path) -> Result<Value> {
-    let exe = std::env::current_exe()?;
-    let cfg = config.canonicalize().unwrap_or_else(|_| config.to_path_buf());
-    #[cfg(unix)]
-    {
-        if !is_root() {
-            bail!("run Postwright as root (sudo) to install it as a service");
-        }
-        if !Path::new("/run/systemd/system").exists() {
-            bail!("this system doesn't use systemd; start Postwright with your init system instead");
-        }
-        let unit = format!(
-            "[Unit]\nDescription=Postwright mail server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} -c {} serve\nRestart=on-failure\nRestartSec=5\nLimitNOFILE=65536\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nProtectSystem=full\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
-            exe.display(),
-            cfg.display()
-        );
-        std::fs::write("/etc/systemd/system/postwright.service", unit).context("writing /etc/systemd/system/postwright.service")?;
-        let run = |args: &[&str]| -> Result<()> {
-            let o = std::process::Command::new("systemctl").args(args).output()?;
-            if !o.status.success() {
-                bail!("systemctl {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
-            }
-            Ok(())
-        };
-        run(&["daemon-reload"])?;
-        run(&["enable", "postwright"])?;
-        Ok(json!({ "ok": true, "how": "systemd service \"postwright\" (starts at boot)" }))
-    }
-    #[cfg(windows)]
-    {
-        let tr = format!("\"{}\" -c \"{}\" serve", exe.display(), cfg.display());
-        let o = std::process::Command::new("schtasks")
-            .args(["/Create", "/TN", "Postwright", "/TR", &tr, "/SC", "ONSTART", "/RU", "SYSTEM", "/RL", "HIGHEST", "/F"])
-            .output()?;
-        if !o.status.success() {
-            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            if msg.to_ascii_lowercase().contains("access is denied") {
-                bail!("Windows refused: close Postwright and start it again with \"Run as administrator\" to install it");
-            }
-            bail!("schtasks: {msg}");
-        }
-        // Scheduled tasks stop after 72 hours by default: remove the limit.
-        let ps = "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Set-ScheduledTask -TaskName Postwright -Settings $s | Out-Null";
-        let _ = std::process::Command::new("powershell").args(["-NoProfile", "-Command", ps]).output();
-        Ok(json!({ "ok": true, "how": "Windows scheduled task \"Postwright\" (starts at boot, runs in the background)" }))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (exe, cfg);
-        bail!("not supported on this platform")
-    }
-}
-
-/// Start the installed service a few seconds after this process exits.
-fn hand_over_to_service() {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("sh").args(["-c", "sleep 3; systemctl start postwright"]).spawn();
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("cmd").args(["/C", "timeout /t 4 /nobreak >nul & schtasks /Run /TN Postwright"]).spawn();
-    }
-    println!("\n  Setup finished. Postwright now runs as a service; this window can be closed.\n");
-    std::process::exit(0);
-}
