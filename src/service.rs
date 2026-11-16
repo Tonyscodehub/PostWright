@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const NAME: &str = "Postwright";
 
+static AS_SERVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True inside the Windows service process.
+pub fn running_as_service() -> bool {
+    AS_SERVICE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Stops `serve` (used by the Windows service control handler).
 pub static STOP: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
@@ -207,11 +214,13 @@ mod win {
         let handler = |c| match c {
             ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
                 super::STOP.notify_one();
+                // Windows waits for StopPending/Stopped; serve() returns within a moment.
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         };
+        super::AS_SERVICE.store(true, std::sync::atomic::Ordering::Relaxed);
         let Ok(h) = service_control_handler::register(NAME, handler) else { return };
         let status = |state, code: u32| ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,

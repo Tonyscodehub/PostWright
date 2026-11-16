@@ -916,7 +916,9 @@ pub fn serve(path: &Path) -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     admin::mark_start();
     if setup::needed(path)? {
-        rt.block_on(setup::run(path))?;
+        if !rt.block_on(setup::run(path))? {
+            return Ok(());
+        }
     }
     let cfg = Config::load(path)?;
     rt.block_on(async move {

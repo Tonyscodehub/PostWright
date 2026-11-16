@@ -165,8 +165,9 @@ fn open_browser(url: &str) {
     }
 }
 
-/// Run the wizard until it's finished. Returns when Postwright should start normally.
-pub async fn run(path: &Path) -> Result<()> {
+/// Run the wizard until it's finished. Returns true when Postwright should start
+/// normally, false when it was asked to stop (Windows service stop, Ctrl+C).
+pub async fn run(path: &Path) -> Result<bool> {
     if !path.exists() {
         write_initial_config(path, &machine_name())?;
         tracing::info!("wrote a starting configuration to {}", path.display());
@@ -239,7 +240,11 @@ pub async fn run(path: &Path) -> Result<()> {
     tracing::info!("setup wizard waiting on port {port}");
     open_browser(&first);
 
-    st.done.notified().await;
+    let finished = tokio::select! {
+        _ = st.done.notified() => true,
+        _ = crate::service::STOP.notified() => false,
+        _ = tokio::signal::ctrl_c() => false,
+    };
     for t in tasks {
         t.abort();
     }
@@ -247,9 +252,13 @@ pub async fn run(path: &Path) -> Result<()> {
         h.abort();
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    if !finished {
+        tracing::info!("setup wizard stopped before it was finished");
+        return Ok(false);
+    }
     let _ = std::fs::remove_file(&code_file);
     println!("\n  Setup finished: starting Postwright.\n");
-    Ok(())
+    Ok(true)
 }
 
 fn restart_receiver(st: &Arc<State>) {
@@ -406,7 +415,8 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
                 bail!("create an administrator account first");
             }
             srv.store.call(|c| store::set_meta(c, "setup.done", &store::now().to_string())).await?;
-            let use_service = b["start_service"].as_bool().unwrap_or(false);
+            // Already running as the service: just carry on in this process.
+            let use_service = b["start_service"].as_bool().unwrap_or(false) && !crate::service::running_as_service();
             let st2 = st.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
@@ -472,6 +482,7 @@ async fn state(st: &Arc<State>, srv: &Shared) -> Result<Value> {
         "admin_networks": srv.cfg.security.admin_networks,
         "listeners": srv.cfg.listeners.https,
         "service": crate::service::state().describe(),
+        "running_as_service": crate::service::running_as_service(),
         "service_supported": is_root() && (cfg!(windows) || Path::new("/run/systemd/system").exists()),
     }))
 }

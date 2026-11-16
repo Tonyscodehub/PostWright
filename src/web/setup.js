@@ -324,7 +324,7 @@ async function finish() {
   const st = await api("GET", "migrate/status");
   const migrating = st.progress.running;
   const win = S.platform === "windows";
-  const canService = S.service_supported;
+  const canService = S.service_supported && !S.running_as_service;
   const issues = [];
   if (!S.admins.length) issues.push("Create an administrator account (step 5).");
   if (!S.domains.length) issues.push("Add at least one domain (step 4).");
@@ -352,7 +352,8 @@ async function finish() {
       h("p", {}, h("a", { href: "/login?next=%2Fadmin" }, "Go to the sign-in page"))));
     location.replace("/login?next=%2Fadmin");
   };
-  const why = !canService
+  const why = S.running_as_service ? "Postwright is already running as a service, so it carries straight on when you finish."
+    : !canService
     ? (win ? "To install the service, close this window and start postwright.exe again with right-click → Run as administrator. Setup carries on where you left off."
            : S.platform === "linux" && !S.is_root ? "To install the service, stop Postwright and start it again with sudo."
            : "This system doesn't use systemd, so start Postwright from your init system.")
