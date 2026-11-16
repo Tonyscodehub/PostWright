@@ -125,6 +125,10 @@ struct State {
     code: String,
     done: Notify,
     receiver: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The certificate the setup page started with. It's kept for the whole wizard
+    /// even if the certificate files change, because the browser has only accepted
+    /// this one: a new self-signed certificate would make every request fail.
+    tls: tokio_rustls::TlsAcceptor,
     finished: std::sync::atomic::AtomicBool,
 }
 
@@ -170,7 +174,15 @@ pub async fn run(path: &Path) -> Result<()> {
     let cfg = Config::load(path)?;
     self_signed(&cfg, false)?;
     let srv = server::Server::new(cfg).context("starting the setup wizard")?;
-    let st = Arc::new(State { path: path.to_path_buf(), srv: RwLock::new(srv.clone()), code: new_code(), done: Notify::new(), receiver: Default::default(), finished: Default::default() });
+    let st = Arc::new(State {
+        path: path.to_path_buf(),
+        tls: srv.tls(),
+        srv: RwLock::new(srv.clone()),
+        code: new_code(),
+        done: Notify::new(),
+        receiver: Default::default(),
+        finished: Default::default(),
+    });
 
     // Bind the HTTPS listeners, falling back to 8443 (e.g. Linux without root).
     let mut bound: Vec<(tokio::net::TcpListener, u16)> = Vec::new();
@@ -197,7 +209,7 @@ pub async fn run(path: &Path) -> Result<()> {
                 let Ok((tcp, peer)) = l.accept().await else { continue };
                 let st = st.clone();
                 tokio::spawn(async move {
-                    let acceptor = st.srv.read().unwrap().tls();
+                    let acceptor = st.tls.clone();
                     let Ok(stream) = crate::net::accept_tls(&acceptor, tcp).await else { return };
                     let io = hyper_util::rt::TokioIo::new(stream);
                     let svc = hyper::service::service_fn(move |req| {
@@ -329,6 +341,9 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
             let host = b["hostname"].as_str().unwrap_or("").trim().trim_end_matches('.').to_ascii_lowercase();
             if !host.contains('.') || host.len() > 253 || !host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
                 bail!("enter the server's full name, e.g. mail.yourcompany.com");
+            }
+            if host == srv.cfg.hostname {
+                return Ok(json!({ "ok": true, "certificate_regenerated": false }));
             }
             let h2 = host.clone();
             edit_config(&st.path, |t| {

@@ -32,7 +32,9 @@ function toast(msg, ok = true) {
 async function api(method, path, body) {
   const opts = { method, headers: { "X-Setup-Code": code, "X-Requested-With": "setup" } };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
-  const r = await fetch("/setup/api/" + path, opts);
+  let r;
+  try { r = await fetch("/setup/api/" + path, opts); }
+  catch (e) { throw new Error("Couldn't reach Postwright. Is it still running? If you restarted it, reload this page."); }
   const data = await r.json().catch(() => ({}));
   if (r.status === 401) { sessionStorage.removeItem("pw-setup-code"); code = ""; askCode(data.error); throw new Error(data.error || "setup code needed"); }
   if (!r.ok) throw new Error(data.error || r.statusText);
@@ -140,7 +142,6 @@ async function server() {
     const r = await busy(e.target, () => api("POST", "hostname", { hostname: host.value.trim() }));
     if (!r) return;
     sessionStorage.setItem("pw-host-ok", "1");
-    if (r.certificate_regenerated) toast("Saved. The temporary certificate was remade for this name, so your browser may warn again.", true);
     next();
   } }, "Save and continue");
   page("What's this server called?", "The name mail apps and other mail servers use to reach it. It doesn't have to match your email domain: one server can host many domains.",
@@ -337,11 +338,14 @@ async function finish() {
     ["pw-step", "pw-from", "pw-host-ok", "pw-cert-ok", "pw-spam-ok", "pw-dns-ok", "pw-migrate-ok", "pw-setup-code"].forEach((k) => sessionStorage.removeItem(k));
     main.replaceChildren(h("div", { class: "center" }, h("h2", {}, "Starting Postwright…"), h("p", { class: "lead" }, "You'll be taken to the sign-in page in a moment.")));
     document.getElementById("steps").replaceChildren();
-    for (let i = 0; i < 60; i++) {
-      await new Promise((res) => setTimeout(res, 2000));
-      try { const p = await fetch("/login", { cache: "no-store" }); if (p.ok) { location.replace("/login?next=%2Fadmin"); return; } } catch (_) { /* restarting */ }
-    }
-    main.replaceChildren(h("div", { class: "center" }, h("h2", {}, "Postwright is running"), h("p", {}, "Sign in at ", h("a", { href: "/login?next=%2Fadmin" }, "/login"), ".")));
+    // The running server may present a different temporary certificate from the one
+    // this page was opened with, which background requests can't get past. So wait,
+    // then navigate: the browser then shows its warning page if it needs to.
+    await new Promise((res) => setTimeout(res, useService ? 9000 : 5000));
+    main.replaceChildren(h("div", { class: "center" }, h("h2", {}, "Postwright is running"),
+      h("p", { class: "lead" }, "If your browser warns about the certificate again, that's the temporary one made for your server name: continue to the page."),
+      h("p", {}, h("a", { href: "/login?next=%2Fadmin" }, "Go to the sign-in page"))));
+    location.replace("/login?next=%2Fadmin");
   };
   const startHere = h("button", { disabled: issues.length > 0, onclick: (e) => done(false, e.target) }, "Finish and start Postwright");
   const startSvc = h("button", { disabled: true, onclick: (e) => done(true, e.target) }, "Finish and start the service");
