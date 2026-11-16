@@ -297,7 +297,7 @@ async fn handle(st: Arc<State>, peer: SocketAddr, req: hyper::Request<hyper::bod
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         return json_err(StatusCode::UNAUTHORIZED, "That setup code isn't right. It's shown in the window where Postwright is running.");
     }
-    if r.method != "GET" && !r.header("content-type").unwrap_or_default().starts_with("application/json") {
+    if !matches!(r.method.as_str(), "GET" | "DELETE") && !r.header("content-type").unwrap_or_default().starts_with("application/json") {
         return json_err(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Content-Type must be application/json");
     }
     match api(&st, &srv, &r, rest).await {
