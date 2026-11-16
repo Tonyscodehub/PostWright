@@ -61,6 +61,20 @@
   .edit td { padding:12px 8px; }
   .dns td code { display:block; max-width:520px; }
   label.c { display:inline-flex; gap:6px; align-items:center; }
+  .choices { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:10px; }
+  button.choice { background:var(--card); color:var(--ink); border:1px solid var(--line); text-align:left; padding:12px 14px; display:flex; flex-direction:column; gap:3px; border-radius:8px; }
+  button.choice span { color:var(--muted); font-size:13px; }
+  button.choice:hover, button.choice.sel { border-color:var(--accent); background:var(--accent-soft); }
+  .form { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:10px 16px; margin:12px 0; }
+  .field label { display:block; font-weight:600; font-size:13px; margin-bottom:4px; }
+  .field input[type=text], .field input[type=email], .field input[type=password], .field select { width:100%; }
+  .field .row { flex-wrap:nowrap; }
+  .field .row > input[type=text], .field .row > select { width:auto; flex:1 1 auto; min-width:0; }
+  .field .row > input[type=number] { width:90px; flex:none; }
+  .small { font-size:12px; }
+  .scroll { max-height:460px; overflow:auto; }
+  .card.note { border-color:var(--warn); background:var(--warn-soft); }
+  pre.scopes { margin-top:6px; white-space:pre-wrap; user-select:all; }
   @media (max-width: 760px) { body { grid-template-columns:1fr; } nav { position:static; height:auto; } nav .foot { position:static; margin-top:10px; } }
 </style>
 </head>
@@ -72,6 +86,7 @@
   <a href="#domains">Domains</a>
   <a href="#users">Users</a>
   <a href="#access">Mailbox access</a>
+  <a href="#migration">Migration</a>
   <a href="#aliases">Aliases</a>
   <a href="#queue">Mail queue</a>
   <a href="#filters">Spam &amp; antivirus</a>
@@ -81,6 +96,7 @@
   <div class="foot"><a href="/">My settings</a> · <a href="#" id="signout">Sign out</a> · <span id="ver"></span></div>
 </nav>
 <main id="main"></main>
+<script src="/migrate.js"></script>
 <script src="/admin.js"></script>
 </body>
 </html>

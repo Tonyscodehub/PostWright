@@ -8,6 +8,7 @@ pub const DAV: &str = "DAV:";
 pub const CALDAV: &str = "urn:ietf:params:xml:ns:caldav";
 pub const CS: &str = "http://calendarserver.org/ns/";
 pub const APPLE: &str = "http://apple.com/ns/ical/";
+pub const CARDDAV: &str = "urn:ietf:params:xml:ns:carddav";
 
 #[derive(Debug, Clone, Default)]
 pub struct Elem {
@@ -156,6 +157,7 @@ pub fn qname(ns: &str, name: &str) -> (String, String) {
         CALDAV => "C",
         CS => "CS",
         APPLE => "A",
+        CARDDAV => "R",
         _ => "",
     };
     if prefix.is_empty() {
@@ -165,7 +167,7 @@ pub fn qname(ns: &str, name: &str) -> (String, String) {
     }
 }
 
-pub const MULTISTATUS_OPEN: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CS=\"http://calendarserver.org/ns/\" xmlns:A=\"http://apple.com/ns/ical/\">\n";
+pub const MULTISTATUS_OPEN: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CS=\"http://calendarserver.org/ns/\" xmlns:A=\"http://apple.com/ns/ical/\" xmlns:R=\"urn:ietf:params:xml:ns:carddav\">\n";
 
 #[cfg(test)]
 mod tests {

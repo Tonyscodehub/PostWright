@@ -13,7 +13,7 @@ with sync_playwright() as p:
     page.screenshot(path="/home/claude/shots/login.png")
     page.fill("#email", "tony@johncock.test"); page.fill("#password", "CorrectHorse1"); page.click("#go")
     page.wait_for_timeout(1500)
-    for name in ["overview", "domains", "users", "access", "aliases", "queue", "filters", "import", "logs"]:
+    for name in ["overview", "domains", "users", "access", "migration", "aliases", "queue", "filters", "import", "logs"]:
         page.goto(f"https://127.0.0.1:8443/admin#{name}")
         page.wait_for_timeout(1200)
         if name == "domains":

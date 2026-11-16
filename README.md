@@ -7,7 +7,7 @@ One binary provides:
 - **SMTP inbound (MX)** on port 25, with SPF, DKIM, and DMARC verification
 - **Authenticated submission** on 587 (STARTTLS) and 465 (implicit TLS), with DKIM signing
 - **IMAP4rev1** on 143 (STARTTLS) and 993 (TLS), with IDLE push, MOVE, UIDPLUS, and SPECIAL-USE
-- **CalDAV calendars with sharing** over HTTPS on 443
+- **CalDAV calendars and CardDAV contacts**, both shareable, plus an automatic company **Directory** address book
 - **Out-of-office auto-replies** and **server-stored signatures**
 - **Two-step verification** with any authenticator app (QR code set-up), plus app passwords and recovery codes
 - **Shared mailboxes and delegation**: open other people's mailboxes, and **send on behalf of** or **send as** them
@@ -15,7 +15,8 @@ One binary provides:
 - **An admin console**, both in the browser at `/admin` and as a Windows desktop app (**Postwright Admin**)
 - An **outbound queue** with MX failover, retries with back-off, and bounce reports
 - **Antispam and antivirus filtering**: built-in checks, plus ClamAV, Rspamd, and SpamAssassin plugins
-- **One-command migration from iRedMail**, keeping passwords, DKIM keys, mail, and calendars
+- **A first-run setup wizard** in the browser: no command lines needed
+- **Migrations** from Microsoft 365, Google Workspace, Exchange Server, any IMAP server, Google Takeout and other exported files, and iRedMail (keeping passwords and DKIM keys)
 
 It works with Mailwright, Thunderbird, Apple Mail and Calendar, Outlook (IMAP), iOS, Android (K-9, FairEmail, DAVx5), and anything else that speaks the standards.
 
@@ -71,16 +72,35 @@ ClamAV and Rspamd are Linux services. With Postwright on Windows, run them on a 
 
 ## Quick start
 
+1. Put Postwright on the server: copy `postwright.exe` into a folder of its own on Windows, or `postwright` to `/usr/local/bin` on Linux.
+2. Start it:
+   - **Windows:** right-click `postwright.exe` → **Run as administrator**.
+   - **Linux:** `sudo postwright -c /etc/postwright/postwright.toml`
+3. The first time, it opens a **setup page** in your browser (on Linux, open the link it prints). The browser will warn about the certificate: that's expected until a real one is installed, so continue to the page.
+
+The wizard walks through each step in order, checking as it goes:
+
+1. **Server name:** for example `mail.yourcompany.com`, with a live check of its DNS, reverse DNS, and whether outgoing port 25 is blocked.
+2. **Your mail today:** starting fresh, iRedMail on this machine, or another system.
+3. **Domains:** add each one; DKIM keys are generated.
+4. **Your administrator account**, or make an imported account an administrator.
+5. **Certificate:** OPNsense ACME push (it shows the exact values to enter), paste one you have, or later.
+6. **Spam and viruses:** ClamAV, Rspamd and SpamAssassin are found automatically if they're running.
+7. **DNS records:** each record to publish, with copy buttons and a live check.
+8. **Bring mail across** from Microsoft 365, Google, Exchange, IMAP or files (see [Migrations](#migrations)).
+9. **Finish:** optionally install it to start at boot (a systemd service on Linux, a background task on Windows), then it starts and takes you to the sign-in page.
+
+The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. Once an administrator exists and setup is finished, it's gone.
+
+Everything can also be done from the command line, for scripting:
+
 ```sh
 postwright init --hostname mail.example.com      # writes postwright.toml (+ a self-signed cert)
 postwright domain add example.com                # generates a DKIM key and prints the DNS records
-postwright domain add example.co.uk              # as many domains as you like
 postwright user add tony@example.com             # prompts for the password
-postwright alias add hello@example.co.uk tony@example.com
+postwright user admin tony@example.com
 postwright serve
 ```
-
-Then open `https://mail.example.com/` to set out of office, signature, calendars, and password.
 
 ### Connecting Mailwright or any mail app
 
@@ -90,6 +110,7 @@ Then open `https://mail.example.com/` to set out of office, signature, calendars
 | SMTP | mail.example.com | 465 | SSL/TLS | full email address |
 | SMTP (alternative) | mail.example.com | 587 | STARTTLS | full email address |
 | Calendars (CalDAV) | `https://mail.example.com/dav/` | 443 | TLS | full email address |
+| Contacts (CardDAV) | `https://mail.example.com/dav/` | 443 | TLS | full email address |
 
 Thunderbird (and Mailwright, if it uses the same lookup) can configure itself from just the email address. Postwright serves `/.well-known/autoconfig/mail/config-v1.1.xml`. Point an `autoconfig.<domain>` CNAME at the server for each domain, and the SRV records printed by `domain dns` cover clients that use RFC 6186.
 
@@ -240,7 +261,7 @@ It's safe to run repeatedly: anything already imported is skipped.
 
 Not imported:
 
-- SOGo contacts (no CardDAV yet)
+- SOGo contacts (export them from SOGo as .vcf and import them on the settings page)
 - mlmmj list archives (list members do become aliases)
 - Sieve filter rules
 
@@ -264,6 +285,60 @@ postwright user vacation tony@example.com --off
 ## Signatures
 
 Signatures are stored on the server so every device shows the same one (fetch it from `GET /api/v1/settings`). Optionally the server appends it to outgoing mail when the client hasn't. Postwright edits plain-text and HTML parts (7bit, 8bit, and quoted-printable), skips attachments and base64-encoded bodies, and never adds the signature twice.
+
+## Migrations
+
+Under **Administration → Migration** (or step 8 of the setup wizard), choose where the mail is now:
+
+| From | How Postwright reads it | Mail | Calendars | Contacts |
+|---|---|---|---|---|
+| **Microsoft 365 / Exchange Online** | An app registration with read-only Graph permissions (the page shows the five steps). Lists every mailbox for you. | ✓ | ✓ | ✓ |
+| **Google Workspace** | A service account with domain-wide delegation (the page shows the steps). Lists every user for you. | ✓ | ✓ | ✓ |
+| **Exchange Server (on-premises)** | IMAP with one administrator account that has Full Access to the mailboxes | ✓ | via .ics | via .vcf |
+| **Any IMAP server** (cPanel, Plesk, Dovecot, Zimbra, Gmail, Yahoo, iCloud, Fastmail…) | Each user's password or app password, or a Dovecot master user | ✓ | via .ics | via .vcf |
+| **Exported files** | Google Takeout (Gmail labels become folders), mbox from Thunderbird or Apple Mail, .ics, .vcf | ✓ | ✓ | ✓ |
+| **iRedMail** | Directly from its database and Maildirs, keeping passwords and DKIM keys (see below) | ✓ | ✓ | |
+
+**What's kept:** folders (including subfolders and non-English names), read, flagged, answered and draft status, received dates, repeating meetings with their exceptions and cancelled occurrences, reminders, attendees, and contact details.
+
+**What's left behind:** Exchange's Sync Issues, Outbox and other system folders; Gmail's All Mail, Important and Starred views (Gmail labels are kept as folders instead); other people's calendars that were only shared with the user.
+
+**Accounts** that don't exist yet are created (and their domains added, with DKIM keys). They get new random passwords, because Microsoft and Google don't reveal the old ones: download them as a CSV when the migration finishes, and hand them out. Display names come across too.
+
+**Nothing is changed on the old system**, and a migration can be **run again** at any time: only what's new is copied. So:
+
+1. Run the migration while the old system is still live (it can take hours for large mailboxes; it runs in the background).
+2. Switch your MX records to Postwright.
+3. Click **Run again (catch up)** the next day to copy anything that arrived at the old system in the meantime.
+4. Remove the app registration or service account you created.
+
+Up to three mailboxes are copied at once, with automatic back-off when Microsoft or Google ask it to slow down.
+
+From the command line, a migration is a JSON file:
+
+```json
+{
+  "source": { "kind": "exchange_online", "tenant": "contoso.onmicrosoft.com", "client_id": "...", "client_secret": "..." },
+  "mailboxes": [ { "source": "amy@contoso.com", "target": "amy@contoso.com" } ],
+  "options": { "mail": true, "calendars": true, "contacts": true, "create_users": true, "since": null }
+}
+```
+
+```sh
+postwright migrate discover job.json      # list the mailboxes on the old system
+postwright migrate run job.json           # copy (run again to catch up)
+postwright migrate files ./Takeout --user amy@contoso.com
+```
+
+Other sources: `{"kind": "google", "service_account": "<JSON key text>", "admin_email": "admin@company.com"}`, or `{"kind": "imap", "host": "mail.old.com", "port": 993, "security": "tls", "admin": {"user": "admin", "password": "...", "style": "plain"}}` (`"style": "dovecot"` for a Dovecot master user; leave out `admin` and give each mailbox a `password` instead).
+
+## Contacts
+
+Every user has a **Contacts** address book, can create more, and can share them view-only or editable, just like calendars. Phones, Thunderbird, Apple Contacts and DAVx5 find them automatically from the server name.
+
+There's also a read-only **Directory** address book listing everyone in the same email domain, with their aliases. It updates itself as people join and leave. Set `directory = "all"` under `[contacts]` to list everyone on the server, or `"off"` to hide it. Each person can set the name shown there under "Your name" on their settings page.
+
+Contacts can be imported from a .vcf file on the settings page, and each address book downloads as one .vcf.
 
 ## Calendars and sharing
 
@@ -340,7 +415,7 @@ In both cases the message is DKIM-signed for Amy's domain, so it passes DMARC. U
 
 ## Settings API
 
-Sign in with `POST /api/v1/login` (`kind: "web"` sets a session cookie; `"app"` or `"device"` returns a bearer token). All other endpoints need that cookie or `Authorization: Bearer <token>`. HTTP Basic auth is only accepted for CalDAV. State-changing calls must send `Content-Type: application/json`.
+Sign in with `POST /api/v1/login` (`kind: "web"` sets a session cookie; `"app"` or `"device"` returns a bearer token). All other endpoints need that cookie or `Authorization: Bearer <token>`. HTTP Basic auth is only accepted for CalDAV and CardDAV. State-changing calls must send `Content-Type: application/json`.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -353,6 +428,11 @@ Sign in with `POST /api/v1/login` (`kind: "web"` sets a session cookie; `"app"` 
 | DELETE | `/api/v1/calendars/{slug}` | Delete (owner) or leave (sharee) |
 | POST | `/api/v1/calendars/{slug}/shares` | `{ user, write }` |
 | DELETE | `/api/v1/calendars/{slug}/shares/{user}` | Stop sharing |
+| GET / POST | `/api/v1/addressbooks` | List (with counts and shares), or create `{ name }` |
+| DELETE | `/api/v1/addressbooks/{slug}` | Delete (owner) or leave (sharee) |
+| POST / DELETE | `/api/v1/addressbooks/{slug}/shares[/{user}]` | Share `{ user, write }` or stop sharing |
+| POST | `/api/v1/addressbooks/{slug}/import` | `{ vcf }`: import a .vcf file's contents |
+| PUT | `/api/v1/name` | `{ name }`: your display name |
 | GET | `/api/v1/mfa` | Two-step verification status |
 | POST | `/api/v1/mfa/setup` | Start set-up: returns `{ secret, uri, qr_svg }` |
 | POST | `/api/v1/mfa/confirm` | `{ code }`. Turns it on and returns `{ recovery_codes }` |
@@ -404,6 +484,7 @@ Both offer the same tools:
 ```text
 postwright domain   add | alias | list | remove | dns | catch-all
 postwright cert     status | key-add | key-list | key-remove | install
+postwright migrate  run | discover | files
 postwright import   iredmail
 postwright user     add | passwd | list | remove | disable | enable | admin | mfa-reset | vacation | signature
 postwright delegate grant | revoke | list
@@ -436,11 +517,10 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 ## Deployment
 
 - **Linux:** the release binary is fully static (musl), so it runs on any x86-64 distribution. See `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
-- **Windows:** `postwright.exe serve` runs as-is. Use NSSM or `sc.exe` to run it as a service. Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
+- **Windows:** run `postwright.exe` as administrator; the setup wizard's last step can make it start automatically with Windows (as a background task that runs without anyone signed in). Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
 
 ## Not yet included
 
-- CardDAV contacts
 - Server-side filtering rules (Sieve)
 - POP3
 - IMAP CONDSTORE/QRESYNC

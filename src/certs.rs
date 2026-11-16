@@ -339,9 +339,15 @@ pub fn receiver_info(cfg: &crate::config::Config) -> Result<ReceiverInfo> {
 // ------------------------------------------------------------ SSH server
 
 pub async fn run_receiver(srv: Shared) -> Result<()> {
+    start_receiver(srv).await.map(|_| ())
+}
+
+/// Start the receiver; the returned handles stop it when aborted.
+pub async fn start_receiver(srv: Shared) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    let mut handles = Vec::new();
     let addrs = srv.cfg.certs.sftp_listen.clone();
     if addrs.is_empty() {
-        return Ok(());
+        return Ok(handles);
     }
     let key = host_key(&srv.cfg.data_dir)?;
     let config = Arc::new(russh::server::Config {
@@ -363,7 +369,7 @@ pub async fn run_receiver(srv: Shared) -> Result<()> {
         };
         tracing::info!("certificate receiver (SFTP) listening on {addr}");
         let (srv, config) = (srv.clone(), config.clone());
-        tokio::spawn(async move {
+        handles.push(tokio::spawn(async move {
             loop {
                 let Ok((tcp, peer)) = listener.accept().await else { continue };
                 if !crate::admin::in_networks(peer.ip(), &srv.cfg.security.admin_networks) {
@@ -388,9 +394,9 @@ pub async fn run_receiver(srv: Shared) -> Result<()> {
                     }
                 });
             }
-        });
+        }));
     }
-    Ok(())
+    Ok(handles)
 }
 
 struct SshHandler {

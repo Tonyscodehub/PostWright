@@ -17,6 +17,7 @@ enum Page {
     Domains,
     Users,
     Access,
+    Migration,
     Aliases,
     Queue,
     Filters,
@@ -30,6 +31,7 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Domains, "Domains"),
     (Page::Users, "Users"),
     (Page::Access, "Mailbox access"),
+    (Page::Migration, "Migration"),
     (Page::Aliases, "Aliases"),
     (Page::Queue, "Mail queue"),
     (Page::Filters, "Spam & antivirus"),
@@ -107,6 +109,7 @@ struct App {
     domains: Vec<Value>,
     users: Vec<Value>,
     delegations: Vec<Value>,
+    migration: Option<Value>,
     nd_owner: String,
     nd_grantee: String,
     nd_mailbox: String,
@@ -162,6 +165,7 @@ impl App {
             mfa_code: String::new(),
             need_code: false,
             delegations: vec![],
+            migration: None,
             nd_owner: String::new(),
             nd_grantee: String::new(),
             nd_mailbox: "full".into(),
@@ -254,6 +258,7 @@ impl App {
             Page::Domains => "domains".into(),
             Page::Users => "users".into(),
             Page::Access => "delegations".into(),
+            Page::Migration => "migrate/status".into(),
             Page::Aliases => "aliases".into(),
             Page::Queue => "queue".into(),
             Page::Filters => "filters".into(),
@@ -345,6 +350,7 @@ impl App {
                             Page::Domains => self.domains = arr(),
                             Page::Users => self.users = arr(),
                             Page::Access => self.delegations = arr(),
+                            Page::Migration => self.migration = Some(v.clone()),
                             Page::Aliases => self.aliases = arr(),
                             Page::Queue => self.queue = arr(),
                             Page::Filters => self.filters = Some(v.clone()),
@@ -993,6 +999,96 @@ impl App {
         });
     }
 
+    fn migration_view(&mut self, ui: &mut egui::Ui) {
+        self.header(ui, "Migration", "Copy mail, calendars and contacts from Microsoft 365, Google Workspace, Exchange Server, IMAP or exported files.");
+        let ctx = ui.ctx().clone();
+        let Some(st) = self.migration.clone() else {
+            ui.spinner();
+            return;
+        };
+        let p = &st["progress"];
+        let running = p["running"].as_bool().unwrap_or(false);
+        let base = self.client.as_ref().map(|c| c.base().to_string()).unwrap_or_default();
+        card(ui, "", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Set up a new migration in the browser").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(format!("{base}/admin#migration")));
+                }
+                if !running && !st["last_job"].is_null() && ui.button("Run again (catch up)").clicked() {
+                    self.action(&ctx, "POST", "migrate/rerun".into(), json!({}), Page::Migration, "Catch-up started");
+                }
+                if running && ui.button(RichText::new("Stop").color(bad())).clicked() {
+                    self.action(&ctx, "POST", "migrate/cancel".into(), json!({}), Page::Migration, "Stopping");
+                }
+                let created = p["created"].as_array().map(|a| a.len()).unwrap_or(0);
+                if created > 0 && ui.button(format!("Save new passwords ({created})...")).clicked() {
+                    let mut csv = String::from("email,password\n");
+                    for c in p["created"].as_array().into_iter().flatten() {
+                        csv.push_str(&format!("{},{}\n", s(&c[0]), s(&c[1])));
+                    }
+                    if let Some(path) = rfd_save("postwright-new-passwords.csv") {
+                        match std::fs::write(&path, csv) {
+                            Ok(()) => self.toast(format!("Saved to {}", path.display()), true),
+                            Err(e) => self.toast(e.to_string(), false),
+                        }
+                    }
+                }
+            });
+            if !st["last_job"].is_null() {
+                ui.label(RichText::new("Running it again copies only what has arrived since the last run.").small().color(ui.visuals().weak_text_color()));
+            }
+        });
+        let boxes = p["mailboxes"].as_array().cloned().unwrap_or_default();
+        if boxes.is_empty() {
+            card(ui, "", |ui| {
+                ui.label("No migration has run since the server started.");
+            });
+            return;
+        }
+        let title = if running { format!("Migrating from {}", s(&p["source"])) } else { format!("Last migration: {}", s(&p["source"])) };
+        card(ui, &title, |ui| {
+            let w = ui.available_width();
+            let cols = [w * 0.34, w * 0.2, w * 0.12, w * 0.1, w * 0.1];
+            ui.horizontal(|ui| {
+                for (h, cw) in ["Account", "Status", "Messages", "Events", "Contacts"].iter().zip(cols) {
+                    cell(ui, cw, |ui| ui.label(RichText::new(*h).small().strong()));
+                }
+            });
+            ui.separator();
+            for m in &boxes {
+                ui.horizontal(|ui| {
+                    cell(ui, cols[0], |ui| ui.label(s(&m["target"])));
+                    cell(ui, cols[1], |ui| {
+                        let state = s(&m["state"]);
+                        let tone = match state.as_str() {
+                            "done" => Tone::Good,
+                            "failed" => Tone::Bad,
+                            "done with errors" => Tone::Warn,
+                            _ => Tone::Info,
+                        };
+                        pill(ui, &state, tone);
+                    });
+                    cell(ui, cols[2], |ui| ui.label(m["messages"].as_u64().unwrap_or(0).to_string()));
+                    cell(ui, cols[3], |ui| ui.label(m["events"].as_u64().unwrap_or(0).to_string()));
+                    cell(ui, cols[4], |ui| ui.label(m["contacts"].as_u64().unwrap_or(0).to_string()));
+                });
+                let step = s(&m["step"]);
+                let err = s(&m["last_error"]);
+                if !step.is_empty() || !err.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(if err.is_empty() { step } else { err }).small().color(ui.visuals().weak_text_color())).wrap());
+                }
+                ui.separator();
+            }
+        });
+        card(ui, "Log", |ui| {
+            let lines: Vec<String> = p["log"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
+            let start = lines.len().saturating_sub(200);
+            egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(lines[start..].join("\n")).monospace().small()).wrap());
+            });
+        });
+    }
+
     fn aliases_view(&mut self, ui: &mut egui::Ui) {
         self.header(ui, "Aliases", "Addresses that deliver to mailboxes or forward elsewhere. One address can go to several targets.");
         let ctx = ui.ctx().clone();
@@ -1344,6 +1440,7 @@ impl eframe::App for App {
         // Live views poll the server.
         let poll_every = match self.page {
             Page::Logs if self.log_live => Some(Duration::from_secs(3)),
+            Page::Migration if self.migration.as_ref().and_then(|v| v["progress"]["running"].as_bool()).unwrap_or(false) => Some(Duration::from_secs(2)),
             Page::Import if self.import.as_ref().and_then(|v| v["running"].as_bool()).unwrap_or(false) => Some(Duration::from_secs(2)),
             Page::Overview | Page::Queue => Some(Duration::from_secs(30)),
             _ => None,
@@ -1397,6 +1494,7 @@ impl eframe::App for App {
                     Page::Domains => self.domains_view(ui),
                     Page::Users => self.users_view(ui),
                     Page::Access => self.access_view(ui),
+                    Page::Migration => self.migration_view(ui),
                     Page::Aliases => self.aliases_view(ui),
                     Page::Queue => self.queue_view(ui),
                     Page::Filters => self.filters_view(ui),
@@ -1627,4 +1725,16 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Postwright Admin", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Where to save a file: the Downloads (or home) folder, without a dialog dependency.
+fn rfd_save(name: &str) -> Option<std::path::PathBuf> {
+    let dir = dirs::download_dir().or_else(dirs::home_dir)?;
+    let mut p = dir.join(name);
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{}-{n}.csv", name.trim_end_matches(".csv")));
+        n += 1;
+    }
+    Some(p)
 }

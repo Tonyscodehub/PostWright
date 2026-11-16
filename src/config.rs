@@ -20,6 +20,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub filter: crate::filter::FilterConfig,
     pub certs: crate::certs::CertConfig,
+    pub contacts: ContactsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ impl Default for Config {
             security: SecurityConfig::default(),
             filter: crate::filter::FilterConfig::default(),
             certs: crate::certs::CertConfig::default(),
+            contacts: ContactsConfig::default(),
         }
     }
 }
@@ -231,5 +233,19 @@ impl Config {
 
     pub fn blob_dir(&self) -> PathBuf {
         self.data_dir.join("blobs")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContactsConfig {
+    /// Who appears in each user's read-only "Directory" address book: "domain" (people
+    /// in the same email domain), "all" (everyone on this server) or "off".
+    pub directory: String,
+}
+
+impl Default for ContactsConfig {
+    fn default() -> Self {
+        Self { directory: "domain".into() }
     }
 }

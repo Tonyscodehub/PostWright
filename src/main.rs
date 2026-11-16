@@ -2,6 +2,7 @@
 
 mod auth;
 mod caldav;
+mod carddav;
 mod certs;
 mod config;
 mod delivery;
@@ -11,10 +12,12 @@ mod identity;
 mod imap;
 mod iredmail;
 mod logbuf;
+mod migrate;
 mod admin;
 mod net;
 mod prefs;
 mod server;
+mod setup;
 mod smtp;
 mod store;
 mod xml;
@@ -26,13 +29,30 @@ use std::path::{Path, PathBuf};
 use store::Store;
 
 #[derive(Parser)]
-#[command(name = "postwright", version, about = "Secure multi-domain SMTP + IMAP mail server")]
+#[command(
+    name = "postwright",
+    version,
+    about = "Secure multi-domain mail server (SMTP, IMAP, CalDAV, CardDAV)",
+    after_help = "Run with no command to start the server. The first time, it opens a setup page in your browser."
+)]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(short, long, default_value = "postwright.toml", global = true)]
-    config: PathBuf,
+    /// Path to the configuration file (default: postwright.toml here, or next to the program on Windows).
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
+}
+
+fn config_path(given: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = given {
+        return p;
+    }
+    let here = PathBuf::from("postwright.toml");
+    if here.exists() || !cfg!(windows) {
+        return here;
+    }
+    // Double-clicked on Windows: keep everything next to the program.
+    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("postwright.toml"))).unwrap_or(here)
 }
 
 #[derive(Subcommand)]
@@ -76,6 +96,12 @@ enum Cmd {
     Import {
         #[command(subcommand)]
         cmd: ImportCmd,
+    },
+    /// Copy mail, calendars and contacts from Exchange Online, Google Workspace, any IMAP
+    /// server, or exported files. (Easier from the admin console's Migration page.)
+    Migrate {
+        #[command(subcommand)]
+        cmd: MigrateCmd,
     },
     /// Let one user open another's mailbox and/or send from their address.
     Delegate {
@@ -239,6 +265,24 @@ enum CalendarCmd {
 }
 
 #[derive(Subcommand)]
+enum MigrateCmd {
+    /// Run a migration described in a JSON file (see README). Safe to run again: only
+    /// new items are copied.
+    Run { job: PathBuf },
+    /// List the mailboxes on the old system (Exchange Online or Google Workspace).
+    Discover { job: PathBuf },
+    /// Import .mbox (incl. Google Takeout), .ics and .vcf files, or a folder of them.
+    Files {
+        path: PathBuf,
+        #[arg(long)]
+        user: String,
+        /// Folder for mbox files without Gmail labels (default: the file's name).
+        #[arg(long)]
+        folder: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DelegateCmd {
     /// Give GRANTEE access to OWNER's mailbox and/or permission to send from it.
     Grant {
@@ -271,19 +315,44 @@ enum QueueCmd {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if let Cmd::Init { hostname, data_dir } = &cli.cmd {
-        return init(&cli.config, hostname, data_dir);
+    let interactive = std::env::args().len() == 1;
+    let r = real_main();
+    if let Err(e) = &r {
+        // Double-clicked on Windows: keep the window open long enough to read the error.
+        if interactive && cfg!(windows) {
+            eprintln!("\nError: {e:#}\n\nPress Enter to close.");
+            let _ = std::io::stdin().read_line(&mut String::new());
+        }
     }
-    let cfg = Config::load(&cli.config)?;
-    match cli.cmd {
-        Cmd::Serve => serve(cfg),
+    r
+}
+
+fn real_main() -> Result<()> {
+    let cli = Cli::parse();
+    let path = config_path(cli.config);
+    let cmd = cli.cmd.unwrap_or(Cmd::Serve);
+    if let Cmd::Init { hostname, data_dir } = &cmd {
+        return init(&path, hostname, data_dir);
+    }
+    if let Cmd::Serve = cmd {
+        return serve(&path);
+    }
+    let cfg = Config::load(&path).map_err(|e| {
+        if !path.exists() {
+            anyhow!("{} doesn't exist yet: run \"postwright\" on its own to start the setup wizard", path.display())
+        } else {
+            e
+        }
+    })?;
+    match cmd {
+        Cmd::Serve => unreachable!(),
         Cmd::Domain { cmd } => domain_cmd(&cfg, cmd),
         Cmd::User { cmd } => user_cmd(&cfg, cmd),
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
         Cmd::Queue { cmd } => queue_cmd(&cfg, cmd),
         Cmd::Calendar { cmd } => calendar_cmd(&cfg, cmd),
         Cmd::Delegate { cmd } => delegate_cmd(&cfg, cmd),
+        Cmd::Migrate { cmd } => migrate_cmd(cfg, cmd),
         Cmd::Cert { cmd } => cert_cmd(&cfg, cmd),
         Cmd::Import { cmd: ImportCmd::Iredmail { backend, postfix_dir, dry_run, no_mail, no_calendars, user, sql_cmd } } => {
             let st = open_store(&cfg)?;
@@ -629,6 +698,45 @@ fn cert_cmd(cfg: &Config, cmd: CertCmd) -> Result<()> {
     Ok(())
 }
 
+fn migrate_cmd(cfg: Config, cmd: MigrateCmd) -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let srv = server::Server::new(cfg)?;
+        let read_job = |p: &Path| -> Result<migrate::Job> {
+            let t = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            serde_json::from_str(&t).with_context(|| format!("parsing {}", p.display()))
+        };
+        let p = match cmd {
+            MigrateCmd::Discover { job } => {
+                let j = read_job(&job)?;
+                for d in migrate::discover(&srv, &j.source).await? {
+                    println!("{:40} {:30} {}{}", d.source, d.name.unwrap_or_default(), d.kind, if d.exists_here { " (exists here)" } else { "" });
+                }
+                return Ok(());
+            }
+            MigrateCmd::Run { job } => migrate::run_blocking(srv, read_job(&job)?).await?,
+            MigrateCmd::Files { path, user, folder } => {
+                migrate::files::start(srv, path.display().to_string(), user, folder)?;
+                migrate::wait_blocking().await
+            }
+        };
+        for m in &p.mailboxes {
+            println!(
+                "{:32} -> {:32} {:16} {} messages, {} events, {} contacts{}",
+                m.source, m.target, m.state, m.messages, m.events, m.contacts,
+                if m.errors > 0 { format!(", {} errors (last: {})", m.errors, m.last_error.clone().unwrap_or_default()) } else { String::new() }
+            );
+        }
+        if !p.created.is_empty() {
+            println!("\nNew accounts and their passwords:");
+            for (e, pw) in &p.created {
+                println!("  {e}  {pw}");
+            }
+        }
+        Ok(())
+    })
+}
+
 fn delegate_cmd(cfg: &Config, cmd: DelegateCmd) -> Result<()> {
     let st = open_store(cfg)?;
     match cmd {
@@ -721,7 +829,7 @@ fn queue_cmd(cfg: &Config, cmd: QueueCmd) -> Result<()> {
     Ok(())
 }
 
-fn serve(cfg: Config) -> Result<()> {
+fn serve(path: &Path) -> Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(|| logbuf::Tee)
@@ -731,6 +839,10 @@ fn serve(cfg: Config) -> Result<()> {
         .init();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     admin::mark_start();
+    if setup::needed(path)? {
+        rt.block_on(setup::run(path))?;
+    }
+    let cfg = Config::load(path)?;
     rt.block_on(async move {
         let srv = server::Server::new(cfg).context("starting server")?;
         let l = srv.cfg.listeners.clone();

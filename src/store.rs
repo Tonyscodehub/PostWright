@@ -204,6 +204,33 @@ fn migrate(c: &Connection) -> Result<()> {
     if !has("domains", "alias_of")? {
         c.execute_batch("ALTER TABLE domains ADD COLUMN alias_of TEXT")?;
     }
+    if !has("users", "display_name")? {
+        c.execute_batch("ALTER TABLE users ADD COLUMN display_name TEXT")?;
+    }
+    c.execute_batch(crate::carddav::SCHEMA)?;
+    c.execute_batch(crate::migrate::SCHEMA)?;
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    Ok(())
+}
+
+pub fn display_name(c: &Connection, user_id: i64) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT display_name FROM users WHERE id = ?1", [user_id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())
+}
+
+pub fn set_display_name(c: &Connection, user_id: i64, name: Option<&str>) -> Result<()> {
+    let name = name.map(|n| n.trim().chars().filter(|c| !c.is_control()).take(100).collect::<String>()).filter(|n| !n.is_empty());
+    c.execute("UPDATE users SET display_name = ?2 WHERE id = ?1", params![user_id, name])?;
+    Ok(())
+}
+
+pub fn get_meta(c: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+}
+
+pub fn set_meta(c: &Connection, key: &str, value: &str) -> Result<()> {
+    c.execute("INSERT INTO meta(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", params![key, value])?;
     Ok(())
 }
 

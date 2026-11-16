@@ -48,6 +48,13 @@
 <header><h1>Postwright</h1><span><span id="who"></span><span id="admin-link"></span><a href="#" id="signout">Sign out</a></span></header>
 <main>
   <section>
+    <h2>Your name</h2>
+    <p class="hint">Shown to colleagues in the Directory address book.</p>
+    <div class="inline"><input type="text" id="my-name" placeholder="e.g. Tony Johncock" maxlength="100"><button class="secondary" id="save-name">Save</button></div>
+    <span class="status" id="name-status"></span>
+  </section>
+
+  <section>
     <h2>Out of office</h2>
     <p class="hint">Sends one automatic reply per sender every four days. Mailing lists, newsletters and automated mail are never answered.</p>
     <label class="check"><input type="checkbox" id="v-enabled"> Send automatic replies</label>
@@ -80,6 +87,14 @@
     <table><thead><tr><th>Calendar</th><th>Owner</th><th>Shared with</th><th></th></tr></thead><tbody id="cal-rows"></tbody></table>
     <div class="inline"><input type="text" id="new-cal" placeholder="New calendar name"><button class="secondary" id="add-cal">Create</button></div>
     <span class="status" id="cal-status"></span>
+  </section>
+
+  <section>
+    <h2>Contacts</h2>
+    <p class="hint">Add this server to iPhone/Mac Contacts, DAVx5 or Thunderbird as a CardDAV account using <code id="carddav-url"></code>. <b>Directory</b> lists everyone in your organisation and updates itself.</p>
+    <table><thead><tr><th>Address book</th><th>Contacts</th><th>Shared with</th><th></th></tr></thead><tbody id="ab-rows"></tbody></table>
+    <div class="inline"><input type="text" id="new-ab" placeholder="New address book name"><button class="secondary" id="add-ab">Create</button></div>
+    <span class="status" id="ab-status"></span>
   </section>
 
   <section>

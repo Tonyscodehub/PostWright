@@ -122,6 +122,7 @@ struct NewUser {
 #[serde(default)]
 struct UserUpdate {
     password: Option<String>,
+    name: Option<String>,
     quota_mb: Option<i64>,
     enabled: Option<bool>,
     admin: Option<bool>,
@@ -154,11 +155,19 @@ struct ImportReq {
     backend: Option<String>,
 }
 
-async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
+pub(crate) async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
     let segs: Vec<String> = rest.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
     let segs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
     match (r.method.as_str(), segs.as_slice()) {
         ("GET", ["overview"]) => overview(srv).await,
+
+        // ------------------------------------------------------------ migration
+        (m, ["migrate", rest @ ..]) => {
+            if m == "POST" && matches!(rest, ["start" | "rerun" | "files"]) {
+                tracing::info!("admin {} started a migration", me.email);
+            }
+            crate::migrate::api(srv, m, rest, &r.body).await
+        }
 
         // ------------------------------------------------------------ certificate
         ("GET", ["certs"]) => {
@@ -269,6 +278,7 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                         let fwd = store::alias_targets(c, &u.email)?;
                         let vac = crate::prefs::load(c, u.id)?.vacation;
                         let mfa = crate::identity::status(c, u.id)?;
+                        let display_name = store::display_name(c, u.id)?;
                         out.push(j!({
                             "email": u.email, "quota_bytes": u.quota_bytes, "used_bytes": used,
                             "enabled": u.enabled, "admin": u.is_admin,
@@ -277,6 +287,7 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                             "forwards_to": fwd,
                             "out_of_office": vac.active(store::now()),
                             "mfa": mfa.enabled,
+                            "name": display_name,
                             "app_passwords": crate::identity::list_app_passwords(c, u.id)?.len(),
                         }));
                     }
@@ -336,6 +347,9 @@ async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Result<Value> {
                     }
                     if let Some(q) = u.quota_mb {
                         store::set_quota(c, &e2, q.max(0) * 1024 * 1024)?;
+                    }
+                    if let Some(n) = &u.name {
+                        store::set_display_name(c, target.id, Some(n))?;
                     }
                     if let Some(en) = u.enabled {
                         store::set_enabled(c, &e2, en)?;
@@ -578,7 +592,7 @@ async fn overview(srv: &Shared) -> Result<Value> {
 }
 
 /// A/AAAA for the host name, and whether reverse DNS for each points back to it.
-async fn server_dns(srv: &Shared, host: &str) -> (Vec<String>, bool, Vec<String>) {
+pub(crate) async fn server_dns(srv: &Shared, host: &str) -> (Vec<String>, bool, Vec<String>) {
     let mut ips: Vec<IpAddr> = Vec::new();
     if let Ok(v4) = srv.dns.ipv4_lookup(host, None::<&NoCache<String, Arc<Vec<std::net::Ipv4Addr>>>>).await {
         ips.extend(v4.iter().map(|a| IpAddr::V4(*a)));

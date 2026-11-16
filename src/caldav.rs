@@ -229,6 +229,54 @@ fn bump(c: &Connection, cal_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Find or create a calendar by display name (used by migrations). The default
+/// calendar answers to "Calendar" whatever it has been renamed to.
+pub fn calendar_named(c: &Connection, user_id: i64, name: &str) -> Result<i64> {
+    ensure_default(c, user_id)?;
+    if let Some(id) = c
+        .query_row("SELECT id FROM calendars WHERE owner_id = ?1 AND name = ?2", params![user_id, name], |r| r.get(0))
+        .optional()?
+    {
+        return Ok(id);
+    }
+    if name.eq_ignore_ascii_case("calendar") {
+        if let Some(id) = c.query_row("SELECT id FROM calendars WHERE owner_id = ?1 AND slug = 'calendar'", [user_id], |r| r.get(0)).optional()? {
+            return Ok(id);
+        }
+    }
+    let slug = slug_for(c, user_id, name)?;
+    create_calendar(c, user_id, &slug, name, None)?;
+    Ok(c.query_row("SELECT id FROM calendars WHERE owner_id = ?1 AND slug = ?2", params![user_id, slug], |r| r.get(0))?)
+}
+
+/// Store an imported iCalendar object, replacing the one with the same UID. Returns
+/// false when it was already there unchanged.
+pub fn import_object(c: &Connection, cal_id: i64, data: &str) -> Result<bool> {
+    let meta = ics_meta(data)?;
+    let uid = meta.uid.clone().unwrap_or_else(|| hex::encode(&Sha256::digest(data.as_bytes())[..12]));
+    let name = format!(
+        "{}.ics",
+        {
+            let s: String = uid.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(120).collect();
+            if s.is_empty() { hex::encode(&Sha256::digest(uid.as_bytes())[..12]) } else { s }
+        }
+    );
+    let etag = etag_of(data);
+    let old: Option<String> = c.query_row("SELECT etag FROM calendar_objects WHERE calendar_id = ?1 AND name = ?2", params![cal_id, name], |r| r.get(0)).optional()?;
+    if old.as_deref() == Some(etag.as_str()) {
+        return Ok(false);
+    }
+    c.execute(
+        "INSERT INTO calendar_objects(calendar_id, name, etag, data, component, dtstart, dtend, recurring, modified)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(calendar_id, name) DO UPDATE SET etag = ?3, data = ?4, component = ?5, dtstart = ?6, dtend = ?7,
+            recurring = ?8, modified = ?9",
+        params![cal_id, name, etag, data, meta.component, meta.dtstart, meta.dtend, meta.recurring as i64, now()],
+    )?;
+    bump(c, cal_id)?;
+    Ok(true)
+}
+
 // --------------------------------------------------------------------- iCal
 
 /// Unfolded content lines.
@@ -353,9 +401,12 @@ fn cal_href(email: &str, slug: &str) -> String {
 async fn handle_inner(srv: Shared, user: User, req: Req) -> Result<Resp> {
     let segs: Vec<String> = req.path.split('/').filter(|s| !s.is_empty()).map(String::from).collect();
     let segs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
+    if segs.get(1) == Some(&"addressbooks") {
+        return Ok(crate::carddav::handle(srv, user, req).await);
+    }
     if req.method == "OPTIONS" {
         return Ok(crate::http::builder(StatusCode::OK)
-            .header("DAV", "1, 3, access-control, calendar-access, extended-mkcol")
+            .header("DAV", "1, 3, access-control, calendar-access, addressbook, extended-mkcol")
             .header("Allow", "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, MKCOL")
             .body(Default::default())
             .unwrap());
@@ -611,6 +662,7 @@ fn known_props(user: &User, r: &Res, with_data: bool) -> Vec<(&'static str, &'st
             v.push((DAV, "owner", format!("<D:href>{}</D:href>", principal_href(me))));
             v.push((CALDAV, "calendar-home-set", format!("<D:href>{}</D:href>", home_href(me))));
             v.push((CALDAV, "calendar-user-address-set", format!("<D:href>mailto:{}</D:href>", esc(me))));
+            v.push((crate::xml::CARDDAV, "addressbook-home-set", format!("<D:href>{}</D:href>", crate::carddav::home_href(me))));
             v.push((DAV, "current-user-privilege-set", privileges(true)));
         }
         Res::Cal(cal) => {

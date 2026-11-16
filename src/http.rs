@@ -122,26 +122,40 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr) -> Result<()>
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
-async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
+/// Read a whole request (body size-limited).
+pub async fn read_req(req: Request<Incoming>) -> Result<Req, Resp> {
     let (parts, body) = req.into_parts();
     let body = match Limited::new(body, MAX_BODY).collect().await {
         Ok(b) => b.to_bytes(),
-        Err(_) => return text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large"),
+        Err(_) => return Err(text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large")),
     };
-    let r = Req {
+    Ok(Req {
         method: parts.method.as_str().to_ascii_uppercase(),
         path: pct_decode(parts.uri.path()),
         query: parts.uri.query().unwrap_or("").to_string(),
         headers: parts.headers,
         body,
+    })
+}
+
+async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
+    let r = match read_req(req).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
     };
     let p = r.path.clone();
     // Unauthenticated routes.
-    if p.eq_ignore_ascii_case("/.well-known/caldav") {
+    if p.eq_ignore_ascii_case("/.well-known/caldav") || p.eq_ignore_ascii_case("/.well-known/carddav") {
         return builder(StatusCode::MOVED_PERMANENTLY).header("Location", "/dav/").body(Full::default()).unwrap();
     }
     if p.ends_with("/mail/config-v1.1.xml") {
         return autoconfig(&srv, &r);
+    }
+    if p == "/migrate.js" {
+        return builder(StatusCode::OK)
+            .header("Content-Type", "application/javascript; charset=utf-8")
+            .body(Full::new(Bytes::from_static(MIGRATE_JS.as_bytes())))
+            .unwrap();
     }
     if p == "/admin.js" {
         return builder(StatusCode::OK)
@@ -185,7 +199,9 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     // two-factor authentication is on. Mailwright may also use its device token.
     let is_dav = p == "/" && r.method != "GET" || p.starts_with("/dav");
     if is_dav {
-        let user = match session_user(&srv, &r, &["device"]).await {
+        // Downloads (GET) also work from a signed-in browser, e.g. the Export links.
+        let kinds: &'static [&'static str] = if r.method == "GET" { &["web", "app", "device"] } else { &["device"] };
+        let user = match session_user(&srv, &r, kinds).await {
             Some(u) => Some(u),
             None => basic_user(&srv, peer, &r).await,
         };
@@ -423,7 +439,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
     let uid = user.id;
     match (r.method.as_str(), segs.as_slice()) {
         ("GET", ["me"]) => {
-            let used = srv.store.call(move |c| store::user_usage(c, uid)).await?;
+            let (used, name) = srv.store.call(move |c| Ok((store::user_usage(c, uid)?, store::display_name(c, uid)?))).await?;
             let host = srv.cfg.hostname.clone();
             Ok(json(
                 StatusCode::OK,
@@ -432,6 +448,8 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
                     "imap": { "host": host, "port": first_port(&srv.cfg.listeners.imaps, 993), "security": "tls" },
                     "smtp": { "host": host, "port": first_port(&srv.cfg.listeners.submissions, 465), "security": "tls" },
                     "caldav": format!("https://{host}{}/dav/", https_port_suffix(srv)),
+                    "carddav": format!("https://{host}{}/dav/", https_port_suffix(srv)),
+                    "name": name,
                 }),
             ))
         }
@@ -596,6 +614,108 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
             let v = srv.store.call(move |c| identity::granted_to(c, uid)).await?;
             Ok(json(StatusCode::OK, &v))
         }
+        // --------------------------------------------------------------- contacts
+        ("GET", ["addressbooks"]) => {
+            let (u, scope) = (user.clone(), srv.cfg.contacts.directory.clone());
+            let list = srv
+                .store
+                .call(move |c| {
+                    let mut out = Vec::new();
+                    for b in crate::carddav::list_books(c, &u, &scope)? {
+                        let shares = if b.is_owner { crate::carddav::shares_of(c, b.id)? } else { vec![] };
+                        let mut v = serde_json::to_value(&b)?;
+                        v["count"] = serde_json::json!(if b.directory { serde_json::Value::Null } else { crate::carddav::count(c, b.id)?.into() });
+                        v["shares"] = serde_json::json!(shares.iter().map(|(u, w)| serde_json::json!({"user": u, "write": w})).collect::<Vec<_>>());
+                        out.push(v);
+                    }
+                    Ok(out)
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &list))
+        }
+        ("POST", ["addressbooks"]) => {
+            let n: NewCalendar = serde_json::from_slice(&r.body)?;
+            let u = user.clone();
+            let slug = srv
+                .store
+                .call(move |c| {
+                    let slug = crate::carddav::slug_for(c, &u, &n.name)?;
+                    crate::carddav::create_book(c, u.id, &slug, &n.name)?;
+                    Ok(slug)
+                })
+                .await?;
+            Ok(json(StatusCode::CREATED, &serde_json::json!({ "slug": slug })))
+        }
+        ("DELETE", ["addressbooks", slug]) => {
+            let (slug, u) = (slug.to_string(), user.clone());
+            srv.store
+                .call(move |c| {
+                    let b = crate::carddav::resolve(c, &u, &slug, "off")?.ok_or_else(|| anyhow::anyhow!("no such address book"))?;
+                    if b.is_owner {
+                        c.execute("DELETE FROM addressbooks WHERE id = ?1", [b.id])?;
+                    } else {
+                        crate::carddav::unshare(c, b.id, &u.email)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        ("POST", ["addressbooks", slug, "shares"]) => {
+            let s: ShareReq = serde_json::from_slice(&r.body)?;
+            let (slug, u) = (slug.to_string(), user.clone());
+            srv.store
+                .call(move |c| {
+                    let b = crate::carddav::resolve(c, &u, &slug, "off")?
+                        .filter(|b| b.is_owner)
+                        .ok_or_else(|| anyhow::anyhow!("you can only share address books you own"))?;
+                    crate::carddav::share(c, b.id, &s.user, s.write)
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        ("DELETE", ["addressbooks", slug, "shares", who]) => {
+            let (slug, who, u) = (slug.to_string(), who.to_string(), user.clone());
+            srv.store
+                .call(move |c| {
+                    let b = crate::carddav::resolve(c, &u, &slug, "off")?.filter(|b| b.is_owner).ok_or_else(|| anyhow::anyhow!("no such address book"))?;
+                    crate::carddav::unshare(c, b.id, &who)
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
+        ("POST", ["addressbooks", slug, "import"]) => {
+            // Body: the .vcf file's text, as JSON {"vcf": "..."}.
+            #[derive(Deserialize)]
+            struct Imp {
+                vcf: String,
+            }
+            let b: Imp = serde_json::from_slice(&r.body)?;
+            let (slug, u) = (slug.to_string(), user.clone());
+            let n = srv
+                .store
+                .call(move |c| {
+                    let book = crate::carddav::resolve(c, &u, &slug, "off")?.filter(|b| b.write).ok_or_else(|| anyhow::anyhow!("no such address book"))?;
+                    let mut n = 0;
+                    for card in crate::carddav::split_vcards(&b.vcf) {
+                        if crate::carddav::import_card(c, book.id, &card)? {
+                            n += 1;
+                        }
+                    }
+                    Ok(n)
+                })
+                .await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "imported": n })))
+        }
+        ("PUT", ["name"]) => {
+            #[derive(Deserialize)]
+            struct N {
+                name: Option<String>,
+            }
+            let b: N = serde_json::from_slice(&r.body)?;
+            srv.store.call(move |c| store::set_display_name(c, uid, b.name.as_deref())).await?;
+            Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
+        }
         ("GET", ["calendars"]) => {
             let list = srv
                 .store
@@ -706,8 +826,10 @@ fn autoconfig(srv: &Shared, r: &Req) -> Resp {
     </outgoingServer>
   </emailProvider>
   <calendar type="caldav"><username>%EMAILADDRESS%</username><authentication>http-basic</authentication><serverURL>https://{host}{}/dav/</serverURL></calendar>
+  <addressBook type="carddav"><username>%EMAILADDRESS%</username><authentication>http-basic</authentication><serverURL>https://{host}{}/dav/</serverURL></addressBook>
 </clientConfig>
 "#,
+        https_port_suffix(srv),
         https_port_suffix(srv)
     );
     builder(StatusCode::OK).header("Content-Type", "application/xml; charset=utf-8").body(Full::new(Bytes::from(body))).unwrap()
@@ -716,6 +838,7 @@ fn autoconfig(srv: &Shared, r: &Req) -> Resp {
 // --------------------------------------------------------------- web page
 
 const SETTINGS_HTML: &str = include_str!("web/settings.html");
+pub const MIGRATE_JS: &str = include_str!("web/migrate.js");
 const LOGIN_HTML: &str = include_str!("web/login.html");
 const LOGIN_JS: &str = include_str!("web/login.js");
 const SETTINGS_JS: &str = include_str!("web/settings.js");

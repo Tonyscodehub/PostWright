@@ -31,3 +31,7 @@ timeout 200 python3 -I $T/cert_check.py | grep -E "FAIL|passed"
 stop; cp /tmp/pwtest/cert.bak /tmp/pwtest/data/tls/cert.pem; cp /tmp/pwtest/key.bak /tmp/pwtest/data/tls/key.pem
 # Two-step verification, app passwords, delegation, send on behalf (fresh database).
 $T/run_security.sh
+# Migrations and contacts (fresh database, fake cloud APIs).
+$T/run_migrate.sh
+# First-run wizard (default ports, /tmp/wiz).
+echo "setup:"; PWBIN=$B timeout 300 python3 -I $T/setup_check.py | grep -E "FAIL|passed"

@@ -641,3 +641,21 @@ pub async fn health(srv: &Shared) -> Vec<serde_json::Value> {
     }
     out
 }
+
+/// Look for scanners running on this machine at their usual addresses.
+pub async fn detect_local() -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut clam = None;
+    for a in ["127.0.0.1:3310", "unix:/run/clamd.scan/clamd.sock", "unix:/var/run/clamd.scan/clamd.sock", "unix:/run/clamav/clamd.ctl", "unix:/var/run/clamav/clamd.ctl"] {
+        if ping(a, b"zPING\0", "PONG").await.is_ok() {
+            clam = Some(a);
+            break;
+        }
+    }
+    out.push(serde_json::json!({"name": "clamav", "title": "ClamAV antivirus", "address": clam.unwrap_or("127.0.0.1:3310"), "found": clam.is_some()}));
+    let rs = ping("127.0.0.1:11333", b"GET /ping HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n", "PONG").await.is_ok();
+    out.push(serde_json::json!({"name": "rspamd", "title": "Rspamd spam filter", "address": "http://127.0.0.1:11333", "found": rs}));
+    let sa = ping("127.0.0.1:783", b"PING SPAMC/1.5\r\n\r\n", "PONG").await.is_ok();
+    out.push(serde_json::json!({"name": "spamassassin", "title": "SpamAssassin (spamd)", "address": "127.0.0.1:783", "found": sa}));
+    out
+}

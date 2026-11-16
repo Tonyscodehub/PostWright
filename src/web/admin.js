@@ -384,10 +384,23 @@ async function logs() {
   pre.scrollTop = pre.scrollHeight;
 }
 
+// ----------------------------------------------------------------- migration
+let migration = null;
+async function migratePage() {
+  const box = h("div");
+  page("Migration", "Copy mail, calendars and contacts from Microsoft 365, Google Workspace, Exchange Server, any IMAP server or exported files. Nothing is changed on the old system.", box);
+  migration = window.PostwrightMigration(box, {
+    api: (m, p, b) => api(m, "migrate/" + p, b),
+    toast,
+    iredmail: h("a", { href: "#import" }, "Open the iRedMail importer →"),
+  });
+}
+
 // -------------------------------------------------------------------- router
-const pages = { overview, domains, users, access, aliases, queue, filters, certificate, import: importPage, logs };
+const pages = { overview, domains, users, access, migration: migratePage, aliases, queue, filters, certificate, import: importPage, logs };
 async function route() {
   clearTimeout(timer);
+  if (migration) { migration.stop(); migration = null; }
   const name = (location.hash || "#overview").slice(1);
   document.querySelectorAll("nav a[href^='#']").forEach((a) => a.classList.toggle("active", a.getAttribute("href") === "#" + name));
   try { await (pages[name] || overview)(); }

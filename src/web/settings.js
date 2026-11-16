@@ -40,6 +40,8 @@ async function load() {
     $("admin-link").append(a);
   }
   $("caldav-url").textContent = me.caldav;
+  $("carddav-url").textContent = me.carddav;
+  $("my-name").value = me.name || "";
   settings = await call("GET", "settings");
   const v = settings.vacation, s = settings.signature;
   $("v-enabled").checked = v.enabled;
@@ -52,6 +54,7 @@ async function load() {
   $("s-html").value = s.html;
   $("s-append").checked = s.append;
   await loadCalendars(me.email);
+  await loadBooks();
   await Promise.all([loadMfa(), loadAppPasswords(), loadDevices(), loadShared()]);
 }
 
@@ -151,6 +154,90 @@ $("add-cal").onclick = async () => {
   if (!name) return;
   try { await call("POST", "calendars", { name }); $("new-cal").value = ""; loadCalendars(); }
   catch (e) { flash("cal-status", e.message, false); }
+};
+
+$("save-name").onclick = async () => {
+  try { await call("PUT", "name", { name: $("my-name").value }); flash("name-status", "Saved", true); }
+  catch (e) { flash("name-status", e.message, false); }
+};
+
+// ---------------------------------------------------------------- contacts
+async function loadBooks() {
+  const books = await call("GET", "addressbooks");
+  const tbody = $("ab-rows");
+  tbody.replaceChildren();
+  for (const b of books) {
+    const tr = el("tr");
+    const nm = el("td", b.name);
+    if (b.directory) nm.append(el("span", "automatic", "badge"));
+    else if (!b.is_owner) nm.append(el("span", b.owner, "badge"));
+    tr.append(nm, el("td", b.directory ? "everyone" : String(b.count)));
+    const shares = el("td");
+    if (b.is_owner) {
+      for (const s of b.shares) {
+        const line = el("div");
+        line.append(`${s.user} (${s.write ? "can edit" : "view only"}) `);
+        const rm = el("button", "Remove", "secondary");
+        rm.onclick = async () => {
+          try { await call("DELETE", `addressbooks/${encodeURIComponent(b.slug)}/shares/${encodeURIComponent(s.user)}`); loadBooks(); }
+          catch (e) { flash("ab-status", e.message, false); }
+        };
+        line.append(rm);
+        shares.append(line);
+      }
+      const form = el("div", undefined, "inline");
+      const who = el("input"); who.type = "email"; who.placeholder = "colleague@yourdomain";
+      const perm = el("select");
+      perm.append(new Option("View only", "r"), new Option("Can edit", "w"));
+      const add = el("button", "Share", "secondary");
+      add.onclick = async () => {
+        try { await call("POST", `addressbooks/${encodeURIComponent(b.slug)}/shares`, { user: who.value, write: perm.value === "w" }); loadBooks(); }
+        catch (e) { flash("ab-status", e.message, false); }
+      };
+      form.append(who, perm, add);
+      shares.append(form);
+    } else if (!b.directory) {
+      shares.textContent = b.write ? "Shared with me (can edit)" : "Shared with me (view only)";
+    }
+    tr.append(shares);
+    const actions = el("td");
+    if (b.write) {
+      const imp = el("button", "Import .vcf", "secondary");
+      const file = el("input"); file.type = "file"; file.accept = ".vcf,text/vcard"; file.style.display = "none";
+      file.onchange = async () => {
+        if (!file.files.length) return;
+        try {
+          const r = await call("POST", `addressbooks/${encodeURIComponent(b.slug)}/import`, { vcf: await file.files[0].text() });
+          flash("ab-status", `Imported ${r.imported} contact${r.imported === 1 ? "" : "s"}`, true);
+          loadBooks();
+        } catch (e) { flash("ab-status", e.message, false); }
+      };
+      imp.onclick = () => file.click();
+      actions.append(imp, file);
+    }
+    const exp = el("a", "Export", "secondary");
+    exp.href = `/dav/addressbooks/${encodeURIComponent($("who").textContent)}/${encodeURIComponent(b.slug)}/`;
+    exp.style.marginLeft = "6px";
+    actions.append(exp);
+    if (!b.directory) {
+      const del = el("button", b.is_owner ? "Delete" : "Leave", "secondary");
+      del.onclick = async () => {
+        if (!confirm(b.is_owner ? `Delete "${b.name}" and all its contacts?` : `Stop seeing "${b.name}"?`)) return;
+        try { await call("DELETE", `addressbooks/${encodeURIComponent(b.slug)}`); loadBooks(); }
+        catch (e) { flash("ab-status", e.message, false); }
+      };
+      actions.append(del);
+    }
+    tr.append(actions);
+    tbody.append(tr);
+  }
+}
+
+$("add-ab").onclick = async () => {
+  const name = $("new-ab").value.trim();
+  if (!name) return;
+  try { await call("POST", "addressbooks", { name }); $("new-ab").value = ""; loadBooks(); }
+  catch (e) { flash("ab-status", e.message, false); }
 };
 
 // ------------------------------------------------------------ sign-in security
