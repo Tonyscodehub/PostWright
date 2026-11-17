@@ -12,6 +12,7 @@
 //! and only a valid certificate and matching key that cover this server's host name are
 //! ever installed.
 
+use rustls::pki_types::pem::PemObject as _;
 use crate::server::Shared;
 use crate::store;
 use anyhow::{anyhow, bail, Context, Result};
@@ -72,7 +73,7 @@ pub struct CertInfo {
 }
 
 fn parse_pem_chain(pem: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &pem[..]).collect::<Result<_, _>>()?;
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>()?;
     if certs.is_empty() {
         bail!("no certificate found");
     }
@@ -127,7 +128,7 @@ pub fn current(cfg: &crate::config::Config) -> Result<CertInfo> {
 /// Check a certificate chain and key belong together and are usable.
 pub fn validate(chain_pem: &[u8], key_pem: &[u8], hostname: &str, require_host: bool) -> Result<CertInfo> {
     let chain = parse_pem_chain(chain_pem)?;
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])?.ok_or_else(|| anyhow!("no private key found"))?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| anyhow!("no private key found"))?;
     let signing = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| anyhow!("unsupported private key: {e}"))?;
     let info = inspect(&chain[0], hostname)?;
     // The key's public half must match the certificate's.

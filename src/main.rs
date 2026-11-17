@@ -1006,6 +1006,7 @@ pub fn serve(path: &Loc) -> Result<()> {
         }
     }
     let cfg = Config::load_loc(path)?;
+    configloc::lock_down(path, &cfg.data_dir);
     rt.block_on(async move {
         let srv = server::Server::new(cfg).context("starting server")?;
         let l = srv.cfg.listeners.clone();

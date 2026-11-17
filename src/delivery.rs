@@ -8,11 +8,9 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
 use lettre::{Address, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-use mail_auth::common::cache::NoCache;
-use mail_auth::common::crypto::{RsaKey, Sha256};
-use mail_auth::common::headers::HeaderWriter;
+use mail_auth::NoCache;
+use mail_auth::headers::HeaderWriter;
 use mail_auth::dkim::DkimSigner;
-use mail_auth::MX;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -208,7 +206,7 @@ pub const SIGNED_HEADERS: &[&str] = &[
 /// Prepend a DKIM-Signature if the domain has a key. Returns the message unchanged otherwise.
 pub fn dkim_sign(domain: &store::Domain, data: Vec<u8>) -> Result<Vec<u8>> {
     let (Some(sel), Some(key)) = (&domain.dkim_selector, &domain.dkim_key) else { return Ok(data) };
-    let key = RsaKey::<Sha256>::from_pkcs1_pem(key).map_err(|e| anyhow!("DKIM key for {}: {e}", domain.name))?;
+    let key = RingRsaKey::from_pkcs1_pem(key).map_err(|e| anyhow!("DKIM key for {}: {e}", domain.name))?;
     // Only sign headers that are actually present (signing absent headers is legal but
     // prevents later addition; we keep the list conservative).
     let present = header_names(&data);
@@ -226,6 +224,37 @@ pub fn dkim_sign(domain: &store::Domain, data: Vec<u8>) -> Result<Vec<u8>> {
     let mut out = sig.to_header().into_bytes();
     out.extend_from_slice(&data);
     Ok(out)
+}
+
+/// DKIM signing with ring, whose RSA private-key operation is blinded and
+/// constant-time (the pure-Rust `rsa` crate is affected by RUSTSEC-2023-0071).
+struct RingRsaKey(ring::rsa::KeyPair);
+
+impl RingRsaKey {
+    fn from_pkcs1_pem(pem: &str) -> Result<Self> {
+        use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
+        let der = rsa::RsaPrivateKey::from_pkcs1_pem(pem)?.to_pkcs1_der()?;
+        let kp = ring::rsa::KeyPair::from_der(der.as_bytes()).map_err(|e| anyhow!("{e}"))?;
+        Ok(Self(kp))
+    }
+}
+
+impl mail_auth::crypto::SigningKey for RingRsaKey {
+    type Hasher = mail_auth::crypto::Sha256;
+
+    fn sign(&self, input: impl mail_auth::headers::Writable) -> mail_auth::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        input.write(&mut data);
+        let mut sig = vec![0u8; self.0.public().modulus_len()];
+        self.0
+            .sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), &data, &mut sig)
+            .map_err(|_| mail_auth::Error::Crypto(mail_auth::crypto::CryptoError::Library("RSA signing failed".into())))?;
+        Ok(sig)
+    }
+
+    fn algorithm(&self) -> mail_auth::crypto::Algorithm {
+        mail_auth::crypto::Algorithm::RsaSha256
+    }
 }
 
 fn header_names(data: &[u8]) -> Vec<String> {
@@ -420,11 +449,11 @@ fn classify(e: lettre::transport::smtp::Error) -> SendError {
 
 /// MX hosts in preference order, falling back to the domain itself (RFC 5321 5.1).
 async fn mx_hosts(srv: &Shared, domain: &str) -> Result<Vec<String>> {
-    match srv.dns.mx_lookup(domain, None::<&NoCache<String, Arc<Vec<MX>>>>).await {
+    match srv.dns.mx_lookup(domain, None::<&NoCache>).await {
         Ok(mxs) => {
             let mut v = Vec::new();
-            for mx in mxs.iter() {
-                for h in &mx.exchanges {
+            for mx in mxs.records.iter() {
+                for h in mx.exchanges.iter() {
                     let h = h.trim_end_matches('.').to_string();
                     if h.is_empty() {
                         return Ok(vec![]); // RFC 7505 null MX
@@ -439,12 +468,12 @@ async fn mx_hosts(srv: &Shared, domain: &str) -> Result<Vec<String>> {
             }
             Ok(v)
         }
-        Err(mail_auth::Error::DnsRecordNotFound(_)) => {
+        Err(mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(_))) => {
             // No MX: fall back to the address record, unless the domain has none at all.
-            let v4 = srv.dns.ipv4_lookup(domain, None::<&NoCache<String, Arc<Vec<std::net::Ipv4Addr>>>>).await;
-            let v6 = srv.dns.ipv6_lookup(domain, None::<&NoCache<String, Arc<Vec<std::net::Ipv6Addr>>>>).await;
-            let nx4 = matches!(v4, Err(mail_auth::Error::DnsRecordNotFound(_)));
-            let nx6 = matches!(v6, Err(mail_auth::Error::DnsRecordNotFound(_)));
+            let v4 = srv.dns.ipv4_lookup(domain, None::<&NoCache>).await;
+            let v6 = srv.dns.ipv6_lookup(domain, None::<&NoCache>).await;
+            let nx4 = matches!(v4, Err(mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(_))));
+            let nx6 = matches!(v6, Err(mail_auth::Error::Dns(mail_auth::DnsError::RecordNotFound(_))));
             if nx4 && nx6 {
                 Ok(vec![])
             } else {

@@ -164,15 +164,35 @@ fn flags_list(flags: &[String]) -> String {
     format!("({})", flags.join(" "))
 }
 
+/// IMAP LIST wildcards: `*` matches anything, `%` anything but the hierarchy
+/// separator. Dynamic programming, so patterns full of wildcards can't make it
+/// take exponential time.
 fn pattern_match(pat: &[char], name: &[char]) -> bool {
-    match pat.first() {
-        None => name.is_empty(),
-        Some('*') => (0..=name.len()).any(|i| pattern_match(&pat[1..], &name[i..])),
-        Some('%') => (0..=name.len())
-            .take_while(|&i| i == 0 || name[i - 1] != '/')
-            .any(|i| pattern_match(&pat[1..], &name[i..])),
-        Some(c) => !name.is_empty() && name[0] == *c && pattern_match(&pat[1..], &name[1..]),
+    if pat.len() > 1024 || name.len() > 1024 {
+        return false;
     }
+    // ok[j]: pat[..i] matches name[..j]
+    let mut ok = vec![false; name.len() + 1];
+    ok[0] = true;
+    for &p in pat {
+        let mut next = vec![false; name.len() + 1];
+        match p {
+            '*' | '%' => {
+                let mut reach = false;
+                for j in 0..=name.len() {
+                    reach = ok[j] || (reach && j > 0 && (p == '*' || name[j - 1] != '/'));
+                    next[j] = reach;
+                }
+            }
+            c => {
+                for j in 1..=name.len() {
+                    next[j] = ok[j - 1] && name[j - 1] == c;
+                }
+            }
+        }
+        ok = next;
+    }
+    ok[name.len()]
 }
 
 impl Session {
@@ -201,9 +221,16 @@ impl Session {
         loop {
             let line = self.conn.read_line().await?;
             buf.extend_from_slice(&line);
+            // Bound the whole command, not just each literal: one command can chain
+            // any number of literals.
+            let total = if self.user.is_some() { self.srv.cfg.limits.max_message_size + 1024 * 1024 } else { 16 * 1024 };
+            if buf.len() > total {
+                self.conn.send("* BYE Command too large").await?;
+                bail!("oversized command");
+            }
             if let Some((n, plus)) = literal_suffix(&line) {
                 let limit = if self.user.is_some() { self.srv.cfg.limits.max_message_size + 65536 } else { 8192 };
-                if n > limit {
+                if n > limit || buf.len() + n > total {
                     if plus {
                         self.conn.send("* BYE Literal too large").await?;
                         bail!("oversized non-synchronising literal");
@@ -1133,6 +1160,10 @@ mod tests {
         assert!(m("%", "Work"));
         assert!(!m("%", "Work/Projects"));
         assert!(m("Work/%", "Work/Projects"));
+        assert!(m("W*k/*s", "Work/Projects") && !m("W%s", "Work/Projects") && m("%/%", "Work/Projects"));
+        let t = std::time::Instant::now();
+        assert!(!m(&"*a".repeat(40), &"a".repeat(200)[..199].to_string().replace("a", "ab")));
+        assert!(t.elapsed().as_millis() < 200, "wildcard matching must not backtrack");
         assert_eq!(literal_suffix(b"A1 APPEND INBOX {310}"), Some((310, false)));
         assert_eq!(literal_suffix(b"A1 LOGIN {5+}"), Some((5, true)));
     }

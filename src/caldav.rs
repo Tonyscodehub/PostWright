@@ -298,7 +298,7 @@ fn ics_lines(data: &str) -> Vec<String> {
 pub fn ical_time(v: &str) -> Option<i64> {
     let v = v.trim();
     if v.len() >= 15 {
-        let dt = chrono::NaiveDateTime::parse_from_str(&v[..15], "%Y%m%dT%H%M%S").ok()?;
+        let dt = chrono::NaiveDateTime::parse_from_str(v.get(..15)?, "%Y%m%dT%H%M%S").ok()?;
         Some(dt.and_utc().timestamp())
     } else if v.len() == 8 {
         let d = chrono::NaiveDate::parse_from_str(v, "%Y%m%d").ok()?;

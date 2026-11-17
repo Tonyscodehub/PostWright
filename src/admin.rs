@@ -9,11 +9,11 @@ use crate::store::{self, User};
 use crate::{auth, delivery, iredmail, logbuf};
 use anyhow::{anyhow, bail, Result};
 use hyper::StatusCode;
-use mail_auth::common::cache::NoCache;
+use mail_auth::NoCache;
 use serde::Deserialize;
 use serde_json::{json as j, Value};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 static STARTED: OnceLock<Instant> = OnceLock::new();
@@ -739,18 +739,18 @@ async fn overview(srv: &Shared) -> Result<Value> {
 /// A/AAAA for the host name, and whether reverse DNS for each points back to it.
 pub(crate) async fn server_dns(srv: &Shared, host: &str) -> (Vec<String>, bool, Vec<String>) {
     let mut ips: Vec<IpAddr> = Vec::new();
-    if let Ok(v4) = srv.dns.ipv4_lookup(host, None::<&NoCache<String, Arc<Vec<std::net::Ipv4Addr>>>>).await {
-        ips.extend(v4.iter().map(|a| IpAddr::V4(*a)));
+    if let Ok(v4) = srv.dns.ipv4_lookup(host, None::<&NoCache>).await {
+        ips.extend(v4.records.iter().map(|a| IpAddr::V4(*a)));
     }
-    if let Ok(v6) = srv.dns.ipv6_lookup(host, None::<&NoCache<String, Arc<Vec<std::net::Ipv6Addr>>>>).await {
-        ips.extend(v6.iter().map(|a| IpAddr::V6(*a)));
+    if let Ok(v6) = srv.dns.ipv6_lookup(host, None::<&NoCache>).await {
+        ips.extend(v6.records.iter().map(|a| IpAddr::V6(*a)));
     }
     let mut ptrs = Vec::new();
     let mut ok = !ips.is_empty();
     for ip in &ips {
-        match srv.dns.ptr_lookup(*ip, None::<&NoCache<IpAddr, Arc<Vec<String>>>>).await {
+        match srv.dns.ptr_lookup(*ip, None::<&NoCache>).await {
             Ok(names) => {
-                let names: Vec<String> = names.iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).collect();
+                let names: Vec<String> = names.records.iter().map(|n| n.trim_end_matches('.').to_ascii_lowercase()).collect();
                 if !names.iter().any(|n| n == host) {
                     ok = false;
                 }
@@ -783,8 +783,8 @@ async fn dns_check(srv: &Shared, name: &str) -> Result<Value> {
     };
 
     // MX
-    let mx = srv.dns.mx_lookup(name.as_str(), None::<&NoCache<String, Arc<Vec<mail_auth::MX>>>>).await;
-    let mx_hosts: Vec<String> = mx.map(|m| m.iter().flat_map(|x| x.exchanges.iter().map(|h| h.trim_end_matches('.').to_string())).collect()).unwrap_or_default();
+    let mx = srv.dns.mx_lookup(name.as_str(), None::<&NoCache>).await;
+    let mx_hosts: Vec<String> = mx.map(|m| m.records.iter().flat_map(|x| x.exchanges.iter().map(|h| h.trim_end_matches('.').to_string())).collect()).unwrap_or_default();
     let mx_ok = mx_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host));
     push(
         "MX",

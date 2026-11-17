@@ -38,3 +38,8 @@ $T/run_security.sh
 $T/run_migrate.sh
 # First-run wizard (default ports, /tmp/wiz).
 echo "setup:"; PWBIN=$B timeout 300 python3 -I $T/setup_check.py | grep -E "FAIL|passed"
+# Hostile input, then the PROXY protocol (connections from 127.0.0.1 must carry a header).
+start postwright.toml; echo "pentest:"; timeout 600 python3 -I $T/pentest.py | grep -E "FAIL|passed"
+python3 -c "s=open('/tmp/pwtest/postwright.toml').read(); open('/tmp/pwtest/pw_proxy.toml','w').write(s.replace('[security]\n','[security]\nproxy_protocol_from = [\"127.0.0.1/32\"]\n',1))"
+start pw_proxy.toml; echo "pentest proxy:"; timeout 300 python3 -I $T/pentest.py --proxy | grep -E "FAIL|passed"
+stop; $B -c /tmp/pwtest/postwright.toml user mfa-reset amy@poffles.test >/dev/null 2>&1

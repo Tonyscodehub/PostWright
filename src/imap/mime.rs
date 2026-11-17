@@ -474,13 +474,13 @@ pub fn split_addresses(s: &str) -> Vec<(Option<String>, String)> {
             if it.is_empty() {
                 return None;
             }
-            if let (Some(a), Some(b)) = (it.find('<'), it.rfind('>')) {
+            if let (Some(a), Some(b)) = (it.find('<'), it.rfind('>').filter(|&b| b > it.find('<').unwrap_or(usize::MAX))) {
                 let addr = it[a + 1..b].trim().to_string();
                 let name = strip_comments(&it[..a]).trim().trim_matches('"').trim().to_string();
                 Some((if name.is_empty() { None } else { Some(name) }, addr))
             } else {
                 // "addr (Name)" form.
-                let name = it.find('(').and_then(|a| it.rfind(')').map(|b| it[a + 1..b].trim().to_string()));
+                let name = it.find('(').and_then(|a| it.rfind(')').filter(|&b| b > a).map(|b| it[a + 1..b].trim().to_string()));
                 Some((name.filter(|n| !n.is_empty()), strip_comments(it).trim().to_string()))
             }
         })

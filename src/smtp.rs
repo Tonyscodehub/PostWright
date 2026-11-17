@@ -8,7 +8,7 @@ use crate::store::{self, User};
 use anyhow::Result;
 use mail_auth::dmarc::verify::DmarcParameters;
 use mail_auth::spf::verify::SpfParameters;
-use mail_auth::common::headers::HeaderWriter;
+use mail_auth::headers::HeaderWriter;
 use mail_auth::{AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, SpfResult};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -465,17 +465,18 @@ impl Session {
                 return Ok("550 5.6.0 Malformed message".into());
             };
             let dkim = self.srv.dns.verify_dkim(&msg).await;
-            let spf = if mail_from.is_empty() {
-                self.srv.dns.verify_spf(SpfParameters::verify_ehlo(ip, &helo, &host)).await
+            let spf_params = if mail_from.is_empty() {
+                SpfParameters::helo(ip, &helo, &host)
             } else {
-                self.srv.dns.verify_spf(SpfParameters::verify_mail_from(ip, &helo, &host, &mail_from)).await
+                SpfParameters::mail_from(ip, &helo, &host, &mail_from)
             };
+            let spf = self.srv.dns.verify_spf(spf_params.clone()).await;
             let mf_domain = if mail_from.is_empty() { helo.clone() } else { delivery::domain_of(&mail_from) };
             let dmarc = self.srv.dns.verify_dmarc(DmarcParameters::new(&msg, &dkim, &mf_domain, &spf)).await;
-            let header_from = msg.from.first().cloned().unwrap_or_default();
+            let header_from = msg.first_from_address().to_string();
             let ar = AuthenticationResults::new(&host)
                 .with_dkim_results(&dkim, &header_from)
-                .with_spf_mailfrom_result(&spf, ip, &mail_from, &helo)
+                .with_spf_result(&spf, &spf_params)
                 .with_dmarc_result(&dmarc);
             let dmarc_pass = *dmarc.dkim_result() == DmarcResult::Pass || *dmarc.spf_result() == DmarcResult::Pass;
             let dmarc_failed = !dmarc_pass

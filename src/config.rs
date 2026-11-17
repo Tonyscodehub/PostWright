@@ -118,6 +118,11 @@ pub struct SecurityConfig {
     /// Refuse the admin console and admin API to administrators who haven't turned on
     /// two-factor authentication.
     pub require_mfa_for_admins: bool,
+    /// Reverse proxies (addresses or CIDR) that put a PROXY protocol header (v1 or
+    /// v2, HAProxy's "send-proxy") in front of each connection they pass on. From
+    /// these addresses the header is required, and the client address it carries is
+    /// the one used for limits, blocking, admin networks, and logs.
+    pub proxy_protocol_from: Vec<String>,
 }
 
 impl Default for Config {
@@ -211,6 +216,7 @@ impl Default for SecurityConfig {
                 .map(|s| s.to_string())
                 .collect(),
             require_mfa_for_admins: false,
+            proxy_protocol_from: Vec::new(),
         }
     }
 }

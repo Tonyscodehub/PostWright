@@ -280,11 +280,16 @@ impl Store {
             let start = inner.next.fetch_add(1, Ordering::Relaxed) % n;
             // Prefer an idle connection; fall back to waiting on our slot.
             for i in 0..n {
-                if let Ok(mut c) = inner.conns[(start + i) % n].try_lock() {
-                    return f(&mut c);
+                // A request that panicked mid-query poisons its connection's lock.
+                // SQLite rolls back the unfinished transaction, so the connection
+                // is still sound: take it back rather than lose it for good.
+                match inner.conns[(start + i) % n].try_lock() {
+                    Ok(mut c) => return f(&mut c),
+                    Err(std::sync::TryLockError::Poisoned(p)) => return f(&mut p.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => {}
                 }
             }
-            let mut c = inner.conns[start].lock().map_err(|_| anyhow!("db pool poisoned"))?;
+            let mut c = inner.conns[start].lock().unwrap_or_else(|p| p.into_inner());
             f(&mut c)
         })
         .await?
@@ -292,7 +297,7 @@ impl Store {
 
     /// Synchronous access, for the admin CLI.
     pub fn sync<R>(&self, f: impl FnOnce(&mut Connection) -> Result<R>) -> Result<R> {
-        let mut c = self.inner.conns[0].lock().map_err(|_| anyhow!("db pool poisoned"))?;
+        let mut c = self.inner.conns[0].lock().unwrap_or_else(|p| p.into_inner());
         f(&mut c)
     }
 

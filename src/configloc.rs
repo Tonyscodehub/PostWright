@@ -443,3 +443,59 @@ mod tests {
         assert_eq!(t, back);
     }
 }
+
+/// Keep mail, keys and settings away from other local accounts: on Windows only
+/// SYSTEM and Administrators may open the data folder and the registry settings
+/// (ProgramData and HKLM\SOFTWARE are readable by all users by default); on Linux
+/// the data folder is private to the account Postwright runs as. Done once per
+/// installation, at start-up, when running with the rights to do it.
+pub fn lock_down(loc: &Loc, data_dir: &Path) {
+    #[cfg(windows)]
+    {
+        if *loc != Loc::Registry {
+            return;
+        }
+        let home = program_data();
+        let marker = home.join(".locked-down");
+        if marker.exists() {
+            return;
+        }
+        let ok_dir = std::process::Command::new("icacls")
+            .arg(&home)
+            .args(["/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/C", "/Q"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let ps = format!(
+            "$k='HKLM:\\{REG_KEY}'; $a=Get-Acl $k; $a.SetAccessRuleProtection($true,$false); \
+             @($a.Access) | ForEach-Object {{ [void]$a.RemoveAccessRule($_) }}; \
+             foreach($s in 'S-1-5-18','S-1-5-32-544') {{ $a.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule((New-Object System.Security.Principal.SecurityIdentifier $s),'FullControl','ContainerInherit','None','Allow'))) }}; \
+             Set-Acl $k $a"
+        );
+        let ok_reg = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok_dir && ok_reg {
+            let _ = std::fs::write(&marker, b"");
+            tracing::info!("restricted {} and the registry settings to SYSTEM and Administrators", home.display());
+        } else {
+            tracing::warn!("couldn't restrict access to {} and the registry settings (folder: {ok_dir}, registry: {ok_reg}); run as the service or as administrator", home.display());
+        }
+        let _ = data_dir;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = loc;
+        if let Ok(m) = std::fs::metadata(data_dir) {
+            if m.permissions().mode() & 0o077 != 0 {
+                match std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)) {
+                    Ok(()) => tracing::info!("made {} private (0700)", data_dir.display()),
+                    Err(e) => tracing::warn!("couldn't make {} private: {e}", data_dir.display()),
+                }
+            }
+        }
+    }
+}

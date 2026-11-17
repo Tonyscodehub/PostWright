@@ -899,7 +899,7 @@ fn import_sogo(store: &Store, snap: &Snapshot, rep: &mut Report) -> Result<bool>
     let mut pending_shares: Vec<(i64, String, String)> = Vec::new(); // (cal id, sogo acl location/folder, owner)
     for f in folders {
         let (fid, owner, path4, display) = (col(&f, 0), col(&f, 1).to_ascii_lowercase(), col(&f, 2), col(&f, 3));
-        if !known.contains(owner.as_str()) {
+        if !known.contains(owner.as_str()) || fid.parse::<i64>().is_err() {
             continue;
         }
         let Some(u) = store.sync(|c| store::find_user(c, &owner))? else { continue };
@@ -955,14 +955,16 @@ fn import_sogo(store: &Store, snap: &Snapshot, rep: &mut Report) -> Result<bool>
         })?;
         rep.calendars += 1;
         rep.events += n;
+        // Values from the source database go into a SQL literal: double any quotes.
+        let (q_owner, q_path) = (owner.replace('\'', "''"), path4.replace('\'', "''"));
         let acl_src = match &acl_table {
-            Some(t) => format!("SELECT c_uid, c_role FROM {t} WHERE c_folder_id = {fid} AND c_object = '/Users/{owner}/Calendar/{path4}'"),
+            Some(t) => format!("SELECT c_uid, c_role FROM {t} WHERE c_folder_id = {fid} AND c_object = '/Users/{q_owner}/Calendar/{q_path}'"),
             None => {
                 let table = col(&f, 5).rsplit('/').next().unwrap_or("").to_string();
                 if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     continue;
                 }
-                format!("SELECT c_uid, c_role FROM {table} WHERE c_object = '/Users/{owner}/Calendar/{path4}'")
+                format!("SELECT c_uid, c_role FROM {table} WHERE c_object = '/Users/{q_owner}/Calendar/{q_path}'")
             }
         };
         pending_shares.push((cal_id, acl_src, owner));

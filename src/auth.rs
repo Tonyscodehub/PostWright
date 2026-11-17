@@ -154,20 +154,56 @@ pub async fn web_login(store: &Store, email: &str, password: &str, code: Option<
         return Ok(WebLogin::Ok(u));
     }
     let Some(code) = code else { return Ok(WebLogin::NeedCode) };
+    // Someone who has the password could otherwise guess codes from many addresses.
+    if code_attempts_blocked(id) {
+        tracing::warn!("too many wrong two-step codes for {}; refusing codes for a while", u.email);
+        return Ok(WebLogin::Fail);
+    }
     if local_ok {
+        code_attempt(id, true);
         return Ok(WebLogin::Ok(u));
     }
     if radius {
         if let Some(cfg) = crate::radius::current() {
             match crate::radius::check(&cfg, &u.email, password, &code).await {
-                Ok((crate::radius::Answer::Accept, _)) => return Ok(WebLogin::Ok(u)),
+                Ok((crate::radius::Answer::Accept, _)) => {
+                    code_attempt(id, true);
+                    return Ok(WebLogin::Ok(u));
+                }
                 Ok((crate::radius::Answer::Reject(m), _)) => tracing::info!("RADIUS refused the code for {}{}", u.email, m.map(|m| format!(": {m}")).unwrap_or_default()),
                 Ok((crate::radius::Answer::Challenge(_), _)) => tracing::warn!("RADIUS asked {} for another step, which isn't supported yet", u.email),
                 Err(e) => tracing::error!("RADIUS check for {} failed: {e:#}", u.email),
             }
         }
     }
+    code_attempt(id, false);
     Ok(WebLogin::Fail)
+}
+
+/// Wrong two-step codes per account, across all addresses: (count, first in window).
+fn code_failures() -> &'static Mutex<std::collections::HashMap<i64, (u32, Instant)>> {
+    static M: std::sync::OnceLock<Mutex<std::collections::HashMap<i64, (u32, Instant)>>> = std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+const CODE_MAX_FAILURES: u32 = 10;
+const CODE_WINDOW: Duration = Duration::from_secs(900);
+
+fn code_attempts_blocked(user_id: i64) -> bool {
+    let m = code_failures().lock().unwrap_or_else(|p| p.into_inner());
+    matches!(m.get(&user_id), Some((n, t)) if *n >= CODE_MAX_FAILURES && t.elapsed() < CODE_WINDOW)
+}
+
+fn code_attempt(user_id: i64, ok: bool) {
+    let mut m = code_failures().lock().unwrap_or_else(|p| p.into_inner());
+    if ok {
+        m.remove(&user_id);
+        return;
+    }
+    let e = m.entry(user_id).or_insert((0, Instant::now()));
+    if e.1.elapsed() >= CODE_WINDOW {
+        *e = (0, Instant::now());
+    }
+    e.0 += 1;
 }
 
 /// Check the account password itself. Runs Argon2 on the blocking pool.

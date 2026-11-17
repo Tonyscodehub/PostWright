@@ -106,16 +106,31 @@ where
                     tracing::warn!("{name}: connection limit reached, dropping {peer}");
                     continue;
                 };
-                let Some(slot) = srv.guard.connect(peer.ip()) else {
-                    tracing::warn!("{name}: per-IP limit reached for {}", peer.ip());
-                    continue;
-                };
                 let _ = tcp.set_nodelay(true);
                 let srv = srv.clone();
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _slot = slot;
+                    let mut tcp = tcp;
+                    let mut peer = peer;
+                    if crate::admin::in_networks(peer.ip(), &srv.cfg.security.proxy_protocol_from) {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), net::read_proxy_header(&mut tcp)).await {
+                            Ok(Ok(Some(real))) => peer = real,
+                            Ok(Ok(None)) => {} // the proxy's own connection (health check)
+                            Ok(Err(e)) => {
+                                tracing::warn!("{name}: bad PROXY header from {peer}: {e:#}");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::warn!("{name}: no PROXY header from {peer} within 10 seconds");
+                                return;
+                            }
+                        }
+                    }
+                    let Some(_slot) = srv.guard.connect(peer.ip()) else {
+                        tracing::warn!("{name}: per-IP limit reached for {}", peer.ip());
+                        return;
+                    };
                     let res = async {
                         let stream = if implicit_tls { net::accept_tls(&srv.tls(), tcp).await? } else { Stream::Plain(tcp) };
                         handler(srv, stream, peer).await

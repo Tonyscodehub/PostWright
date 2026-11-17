@@ -22,7 +22,7 @@ const CONTACTS: &str = "https://www.googleapis.com/auth/contacts.readonly";
 pub struct Google {
     http: Http,
     email: String,
-    key: rsa::RsaPrivateKey,
+    key: ring::rsa::KeyPair,
     token_uri: String,
     /// Base for all APIs; real Google uses a different host per API.
     api: Option<String>,
@@ -40,7 +40,10 @@ impl Google {
         let sa: Value = serde_json::from_str(service_account.trim()).context("the service account key must be the JSON file Google gave you")?;
         let email = sa["client_email"].as_str().ok_or_else(|| anyhow!("no client_email in the service account key"))?.to_string();
         let pem = sa["private_key"].as_str().ok_or_else(|| anyhow!("no private_key in the service account key"))?;
-        let key = <rsa::RsaPrivateKey as rsa::pkcs8::DecodePrivateKey>::from_pkcs8_pem(pem).map_err(|e| anyhow!("reading the service account's private key: {e}"))?;
+        let der = <rsa::RsaPrivateKey as rsa::pkcs8::DecodePrivateKey>::from_pkcs8_pem(pem)
+            .and_then(|k| rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&k))
+            .map_err(|e| anyhow!("reading the service account's private key: {e}"))?;
+        let key = ring::rsa::KeyPair::from_pkcs8(der.as_bytes()).map_err(|e| anyhow!("reading the service account's private key: {e}"))?;
         if !admin_email.contains('@') {
             bail!("enter a Workspace administrator's address (used to list users)");
         }
@@ -67,9 +70,11 @@ impl Google {
             "iss": self.email, "sub": subject, "scope": scope, "aud": self.token_uri, "iat": now, "exp": now + 3600,
         }))?);
         let signing_input = format!("{header}.{claims}");
-        let sk = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(self.key.clone());
-        let sig = <rsa::pkcs1v15::SigningKey<sha2::Sha256> as rsa::signature::Signer<rsa::pkcs1v15::Signature>>::sign(&sk, signing_input.as_bytes());
-        let jwt = format!("{signing_input}.{}", b64.encode(rsa::signature::SignatureEncoding::to_vec(&sig)));
+        let mut sig = vec![0u8; self.key.public().modulus_len()];
+        self.key
+            .sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), signing_input.as_bytes(), &mut sig)
+            .map_err(|_| anyhow!("signing the Google sign-in request failed"))?;
+        let jwt = format!("{signing_input}.{}", b64.encode(&sig));
         let v = self
             .http
             .json(

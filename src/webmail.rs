@@ -381,8 +381,10 @@ fn safe_filename(n: &str) -> String {
 fn download(data: Vec<u8>, name: &str, ctype: &str, inline: bool) -> Resp {
     // Only images and PDFs are shown inline; everything else downloads, and nothing is
     // ever sniffed or run on this origin.
+    let ctype = ctype.to_ascii_lowercase();
+    let ctype: &str = if ctype.chars().all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c)) { &ctype } else { "application/octet-stream" };
     let show = inline && (ctype.starts_with("image/") && !ctype.contains("svg") || ctype == "application/pdf");
-    let ascii: String = name.chars().map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' }).collect();
+    let ascii: String = name.chars().map(|c| if (c.is_ascii_graphic() || c == ' ') && c != '"' && c != '\\' { c } else { '_' }).collect();
     builder(StatusCode::OK)
         .header("Content-Type", if show { ctype } else { "application/octet-stream" })
         .header(
@@ -1089,7 +1091,7 @@ fn zone(tzid: &str) -> Option<chrono_tz::Tz> {
 fn parse_when(p: &Prop, floating: chrono_tz::Tz) -> Option<When> {
     let v = p.value.trim();
     if p.param("VALUE").map(|x| x.eq_ignore_ascii_case("DATE")).unwrap_or(false) || v.len() == 8 {
-        return NaiveDate::parse_from_str(&v[..8.min(v.len())], "%Y%m%d").ok().map(When::Date);
+        return NaiveDate::parse_from_str(v.get(..8.min(v.len()))?, "%Y%m%d").ok().map(When::Date);
     }
     let (body, utc) = match v.strip_suffix('Z') {
         Some(b) => (b, true),
@@ -1288,7 +1290,9 @@ async fn events(srv: &Shared, user: &User, r: &Req) -> Result<Resp> {
             Ok((cals, objs))
         })
         .await?;
-    let (f, t) = (Utc.timestamp_opt(from, 0).single().unwrap(), Utc.timestamp_opt(to, 0).single().unwrap());
+    let (Some(f), Some(t)) = (Utc.timestamp_opt(from, 0).single(), Utc.timestamp_opt(to, 0).single()) else {
+        bail!("dates out of range");
+    };
     let mut list = Vec::new();
     for (slug, name, data) in objs {
         for mut e in occurrences(&data, f, t, floating) {
@@ -1555,8 +1559,8 @@ async fn delete_event(srv: &Shared, user: &User, r: &Req) -> Result<Resp> {
             let guests: Vec<String> = master.map(|m| m.iter().filter(|p| p.name == "ATTENDEE").map(|p| mailto(&p.value)).filter(|a| *a != me).collect()).unwrap_or_default();
             if let (Some(ts), Some(m)) = (occurrence, master.filter(|m| get(m, "RRULE").is_some())) {
                 // Just this one: add an EXDATE in the series' own form.
-                let p = get(m, "DTSTART").unwrap();
-                let w = Utc.timestamp_opt(ts, 0).single().unwrap();
+                let p = get(m, "DTSTART").ok_or_else(|| anyhow!("that event has no start time"))?;
+                let w = Utc.timestamp_opt(ts, 0).single().ok_or_else(|| anyhow!("date out of range"))?;
                 let ex = if p.param("VALUE").map(|v| v.eq_ignore_ascii_case("DATE")).unwrap_or(false) || p.value.len() == 8 {
                     format!("EXDATE;VALUE=DATE:{}", w.format("%Y%m%d"))
                 } else if let (Some(tz), false) = (p.param("TZID").and_then(zone), p.value.ends_with('Z')) {
@@ -1867,5 +1871,151 @@ mod tests {
         let p = parse_prop("ATTENDEE;CN=\"Smith: John\";PARTSTAT=ACCEPTED:mailto:j@x.org").unwrap();
         assert_eq!(p.param("CN"), Some("Smith: John"));
         assert_eq!(p.value, "mailto:j@x.org");
+    }
+}
+
+/// Mutation fuzzing of every parser that sees untrusted input. Any panic fails the
+/// test and prints the input that caused it.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    const TOKENS: &[&[u8]] = &[
+        b"\r\n", b"\n", b" ", b"{", b"}", b"{5}\r\n", b"{99999999999}", b"(", b")", b"[", b"]", b"\"", b"\\", b":", b";", b"=",
+        b"BEGIN:VEVENT", b"END:VEVENT", b"BEGIN:VCALENDAR", b"RRULE:FREQ=SECONDLY;COUNT=999999999", b"RRULE:FREQ=YEARLY;BYDAY=-53MO",
+        b"DTSTART;TZID=Nowhere/Zone:20260101T000000", b"DTSTART:99999999T999999Z", b"EXDATE:", b"RECURRENCE-ID:", b"DURATION:P9999999W",
+        b"<", b">", b"</", b"<?xml", b"<!DOCTYPE x [<!ENTITY a \"aaaa\">]>", b"&a;", b"&#xFFFFFFFF;", b"xmlns:D=\"DAV:\"",
+        b"Content-Type: multipart/mixed; boundary=b", b"--b", b"--b--", b"Content-Transfer-Encoding: base64", b"=?utf-8?B?", b"?=",
+        b"\xff\xfe", b"\x00", b"\xe2\x80\xae", b"BODY[1.2.3.MIME]", b"OR", b"NOT", b"HEADER", b"1:*", b"*:1", b"4294967296",
+    ];
+
+    fn mutate(r: &mut Rng, seed: &[u8]) -> Vec<u8> {
+        let mut v = seed.to_vec();
+        for _ in 0..1 + r.below(8) {
+            match r.below(5) {
+                0 if !v.is_empty() => {
+                    let i = r.below(v.len());
+                    v[i] = r.next() as u8;
+                }
+                1 => {
+                    let t = TOKENS[r.below(TOKENS.len())];
+                    let i = r.below(v.len() + 1);
+                    v.splice(i..i, t.iter().copied());
+                }
+                2 if !v.is_empty() => {
+                    let i = r.below(v.len());
+                    let j = (i + r.below(64)).min(v.len());
+                    v.drain(i..j);
+                }
+                3 if !v.is_empty() => {
+                    let i = r.below(v.len());
+                    let j = (i + r.below(32)).min(v.len());
+                    let chunk = v[i..j].to_vec();
+                    for _ in 0..r.below(20) {
+                        v.splice(i..i, chunk.iter().copied());
+                    }
+                }
+                _ => v.truncate(r.below(v.len() + 1)),
+            }
+        }
+        v
+    }
+
+    fn run(name: &str, seeds: &[&[u8]], iters: usize, f: impl Fn(&[u8]) + std::panic::RefUnwindSafe) {
+        let extra: u64 = std::env::var("FUZZ_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mut r = Rng(0x9E3779B97F4A7C15 ^ name.len() as u64 ^ extra.wrapping_mul(0x2545F4914F6CDD1D));
+        std::panic::set_hook(Box::new(|_| {}));
+        for i in 0..iters {
+            let input = mutate(&mut r, seeds[i % seeds.len()]);
+            if std::panic::catch_unwind(|| f(&input)).is_err() {
+                let _ = std::panic::take_hook();
+                let _ = std::panic::catch_unwind(|| f(&input));
+                panic!("{name} panicked on input {:?}", String::from_utf8_lossy(&input));
+            }
+        }
+        let _ = std::panic::take_hook();
+    }
+
+    const ICS: &[u8] = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART;TZID=Europe/London:20261005T080000\r\nDTEND;TZID=Europe/London:20261005T090000\r\nRRULE:FREQ=WEEKLY;UNTIL=20261231T000000Z\r\nEXDATE;TZID=Europe/London:20261012T080000\r\nSUMMARY:x\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID;TZID=Europe/London:20261019T080000\r\nDTSTART;TZID=Europe/London:20261019T090000\r\nDTEND;TZID=Europe/London:20261019T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const ICS2: &[u8] = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:b\r\nDTSTART;VALUE=DATE:20261225\r\nRRULE:FREQ=YEARLY\r\nSUMMARY:Holiday\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const VCARD: &[u8] = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nFN:Amy\r\nN:Pond;Amy;;;\r\nEMAIL;TYPE=work:amy@poffles.test\r\nTEL:0123\r\nADR:;;1 Street;Town;;NG1;UK\r\n note\r\nEND:VCARD\r\n";
+    const MAIL: &[u8] = b"From: A <a@x.test>\r\nTo: b@y.test, \"C, D\" <c@z.test>\r\nSubject: =?utf-8?B?aGk=?=\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhi\r\n--b\r\nContent-Type: application/pdf; name=x.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--b--\r\n";
+    const XML: &[u8] = br#"<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT"><C:time-range start="20260101T000000Z" end="20270101T000000Z"/></C:comp-filter></C:comp-filter></C:filter></D:propfind>"#;
+    const IMAP: &[&[u8]] = &[
+        b"a1 UID FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (From Subject)] BODYSTRUCTURE)",
+        b"a2 SEARCH OR FROM \"amy\" NOT SUBJECT {3}\r\nabc SINCE 1-Jan-2026 UID 1:5,7",
+        b"a3 APPEND INBOX (\\Seen) \"05-Oct-2026 08:00:00 +0100\" {5+}\r\nhello",
+        b"a4 STORE 1:3 +FLAGS.SILENT (\\Deleted $Junk)",
+    ];
+
+    #[test]
+    fn calendar_parsers() {
+        let from = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap();
+        run("calendar", &[ICS, ICS2], 200_000, |d| {
+            let s = String::from_utf8_lossy(d);
+            let _ = vevents(&s);
+            let _ = occurrences(&s, from, to, chrono_tz::Europe::London);
+            let _ = crate::caldav::ics_meta(&s);
+            let _ = invite_summary(&s, "a@x.test");
+            let _ = invite_text(&s, "x");
+        });
+    }
+
+    #[test]
+    fn contact_parsers() {
+        run("vcard", &[VCARD], 100_000, |d| {
+            let s = String::from_utf8_lossy(d);
+            let _ = crate::carddav::lines(&s);
+            let _ = crate::carddav::vcard_meta(&s);
+        });
+    }
+
+    #[test]
+    fn mail_parsers() {
+        run("mime", &[MAIL], 200_000, |d| {
+            let p = crate::imap::mime::parse(d);
+            let _ = format!("{:?}", p.header);
+            let _ = crate::imap::mime::header_fields(d);
+            let s = String::from_utf8_lossy(d);
+            let _ = crate::imap::mime::parse_ctype(&s);
+            let _ = crate::imap::mime::split_addresses(&s);
+            let _ = summarise(d, 0);
+        });
+    }
+
+    #[test]
+    fn xml_and_imap_parsers() {
+        run("xml", &[XML], 100_000, |d| {
+            let _ = crate::xml::parse(d);
+        });
+        run("imap", IMAP, 200_000, |d| {
+            if let Ok(t) = crate::imap::parse::tokenize(d) {
+                if t.len() > 2 {
+                    let _ = crate::imap::search::parse(&t[2..]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn radius_reply_parser() {
+        let seed: &[u8] = &[2, 7, 0, 38, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 80, 18, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 4];
+        run("radius", &[seed], 100_000, |d| {
+            let _ = crate::radius::parse_reply(d, 7, &[0; 16], "secret");
+        });
     }
 }

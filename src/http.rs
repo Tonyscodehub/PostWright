@@ -123,14 +123,21 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr) -> Result<()>
 const MAX_BODY: usize = 10 * 1024 * 1024;
 const MAX_MAIL_BODY: usize = 40 * 1024 * 1024;
 
+/// Bodies from anyone not yet signed in (sign-in, setup) are small.
+const MAX_ANON_BODY: usize = 64 * 1024;
+
 /// Read a whole request (body size-limited).
 pub async fn read_req(req: Request<Incoming>) -> Result<Req, Resp> {
+    read_req_limit(req, MAX_BODY).await
+}
+
+async fn read_req_limit(req: Request<Incoming>, limit: usize) -> Result<Req, Resp> {
     let (parts, body) = req.into_parts();
-    // Sending mail from the browser carries attachments (as base64).
-    let limit = if parts.uri.path().starts_with("/api/v1/mail/") { MAX_MAIL_BODY } else { MAX_BODY };
-    let body = match Limited::new(body, limit).collect().await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => return Err(text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large")),
+    // A slow drip of a body mustn't hold the connection open indefinitely.
+    let body = match tokio::time::timeout(Duration::from_secs(300), Limited::new(body, limit).collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(_)) => return Err(text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large")),
+        Err(_) => return Err(text(StatusCode::REQUEST_TIMEOUT, "Request took too long")),
     };
     Ok(Req {
         method: parts.method.as_str().to_ascii_uppercase(),
@@ -141,8 +148,28 @@ pub async fn read_req(req: Request<Incoming>) -> Result<Req, Resp> {
     })
 }
 
+/// How big a body this request may send, decided before reading it: large bodies
+/// only for a valid session (mail with attachments) or calendar/contact uploads that
+/// carry credentials, so strangers can't make the server buffer megabytes each.
+async fn body_limit(srv: &Shared, req: &Request<Incoming>) -> usize {
+    let path = req.uri().path();
+    let probe = Req { method: String::new(), path: String::new(), query: String::new(), headers: req.headers().clone(), body: Bytes::new() };
+    if let Some(t) = session_token(&probe) {
+        let ok = srv.store.call(move |c| identity::session_user(c, &t, &["web", "app", "device"])).await.ok().flatten().is_some();
+        if ok {
+            return if path.starts_with("/api/v1/mail/") { MAX_MAIL_BODY } else { MAX_BODY };
+        }
+    }
+    let basic = probe.header("authorization").map(|h| h.len() > 6 && h[..6].eq_ignore_ascii_case("basic ")).unwrap_or(false);
+    if basic && (path == "/" || path.starts_with("/dav")) {
+        return MAX_BODY;
+    }
+    MAX_ANON_BODY
+}
+
 async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
-    let r = match read_req(req).await {
+    let limit = body_limit(&srv, &req).await;
+    let r = match read_req_limit(req, limit).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };

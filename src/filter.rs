@@ -15,10 +15,9 @@
 
 use crate::server::Shared;
 use anyhow::{anyhow, bail, Context, Result};
-use mail_auth::common::cache::NoCache;
+use mail_auth::NoCache;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -221,17 +220,17 @@ pub async fn dnsbl(srv: &Shared, ip: IpAddr, v: &mut Verdict) {
         let name = format!("{rev}.{}.", bl.zone);
         let srv = srv.clone();
         async move {
-            let r = srv.dns.ipv4_lookup(name.as_str(), None::<&NoCache<String, Arc<Vec<std::net::Ipv4Addr>>>>).await;
+            let r = srv.dns.ipv4_lookup(name.as_str(), None::<&NoCache>).await;
             (bl.clone(), r)
         }
     });
     for (bl, r) in futures_join(lookups.collect()).await {
         if let Ok(addrs) = r {
-            let codes: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+            let codes: Vec<String> = addrs.records.iter().map(|a| a.to_string()).collect();
             // 127.255.255.x means the list refused the query (e.g. public resolver).
-            if addrs.iter().any(|a| a.octets()[0] == 127 && a.octets()[1] != 255) {
+            if addrs.records.iter().any(|a| a.octets()[0] == 127 && a.octets()[1] != 255) {
                 v.add(bl.score, format!("DNSBL_{}", bl.zone.to_ascii_uppercase().replace('.', "_")));
-            } else if addrs.iter().any(|a| a.octets()[1] == 255) {
+            } else if addrs.records.iter().any(|a| a.octets()[1] == 255) {
                 tracing::warn!("{} refused the lookup ({}); use your own resolver or a DQS key", bl.zone, codes.join(","));
             }
         }
