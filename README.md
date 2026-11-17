@@ -536,6 +536,7 @@ Both offer the same tools:
 
 - Only accounts with the admin flag can use the console or app.
 - They only work **from the networks in `security.admin_networks`**: loopback and private ranges by default, so it isn't exposed to the internet.
+- **Behind a reverse proxy** (HAProxy, for example), every visitor seems to come from the proxy's own address. That defeats the admin-network rule and lets one bad guesser block everyone. To fix this, turn on the PROXY protocol for Postwright's server in the proxy (HAProxy: `send-proxy-v2`). Then list the proxy's address in `security.proxy_protocol_from`, for example `["192.168.1.1"]`. Connections from that address must then start with the header, and Postwright uses the real client address it carries. Change both at the same time.
 - State-changing requests need JSON or an `X-Requested-With` header, which blocks cross-site attacks.
 - You can't remove your own admin rights, disable yourself, or delete yourself.
 
