@@ -673,10 +673,25 @@ pub async fn self_test(f: &FilterConfig) -> Vec<serde_json::Value> {
     let rcpts = vec!["postmaster@postwright.invalid".to_string()];
     let env = Envelope { ip: IpAddr::from([127, 0, 0, 1]), helo: "postwright.test", mail_from: "test@postwright.invalid", rcpts: &rcpts, user: None };
     if let Some(c) = &f.clamav {
-        let r = match clamav_scan(c, &msg(EICAR)).await {
-            Ok(Some(v)) => (true, format!("caught the EICAR test virus ({v})")),
-            Ok(None) => (false, "answered, but didn't detect the EICAR test virus (are its virus definitions downloaded?)".into()),
+        // ClamAV's official EICAR signature is a hash of the exact 68-byte
+        // file, so test the bare file first, then the same file attached to
+        // an email to check that ClamAV unpacks mail (ScanMail).
+        let attached = {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(EICAR);
+            format!(
+                "From: test@postwright.invalid\r\nTo: test@postwright.invalid\r\nSubject: Postwright scanner test\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"pwtest\"\r\n\r\n--pwtest\r\nContent-Type: text/plain\r\n\r\nScanner test.\r\n--pwtest\r\nContent-Type: application/octet-stream; name=\"eicar.com\"\r\nContent-Disposition: attachment; filename=\"eicar.com\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{b64}\r\n--pwtest--\r\n"
+            )
+            .into_bytes()
+        };
+        let r = match clamav_scan(c, EICAR.as_bytes()).await {
             Err(e) => (false, format!("not reachable: {e:#}")),
+            Ok(None) => (false, "answered, but didn't detect the EICAR test file. Its virus definitions probably aren't loaded: check the database folder has main and daily files (run freshclam), then restart clamd".into()),
+            Ok(Some(v)) => match clamav_scan(c, &attached).await {
+                Ok(Some(_)) => (true, format!("caught the EICAR test virus, on its own and attached to an email ({v})")),
+                Ok(None) => (false, format!("caught the EICAR test file ({v}) but not when it was attached to an email; set ScanMail yes in clamd.conf and restart clamd")),
+                Err(e) => (false, format!("caught the EICAR test file ({v}) but failed on the email test: {e:#}")),
+            },
         };
         out.push(serde_json::json!({ "name": "ClamAV", "ok": r.0, "detail": r.1 }));
     }
