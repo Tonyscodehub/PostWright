@@ -576,8 +576,9 @@ impl Sftp {
             // OPNsense sends the key last, so this usually waits for it. A renewal that
             // reuses the existing key installs straight away against the current key.
             if let Ok(k) = std::fs::read(&self.srv.cfg.tls.key) {
-                if install(&self.srv, &chain, &k, &format!("SFTP upload from {ip}")).is_ok() {
-                    forget(ip);
+                match install(&self.srv, &chain, &k, &format!("SFTP upload from {ip}")) {
+                    Ok(_) => forget(ip),
+                    Err(e) => tracing::info!("certificate receiver: waiting for the key from {ip} ({e:#})"),
                 }
             }
             return;
@@ -644,8 +645,14 @@ impl russh_sftp::server::Handler for Sftp {
     }
 
     async fn rename(&mut self, id: u32, old: String, new: String) -> Result<Status, Self::Error> {
+        // Some clients upload to a temporary name and rename it into place.
         if let Some(d) = self.files.remove(&base(&old)) {
-            self.files.insert(base(&new), d);
+            let name = base(&new);
+            tracing::info!("certificate receiver: {} renamed to {name} by {}", base(&old), self.peer.ip());
+            self.files.insert(name.clone(), d);
+            if ALLOWED.contains(&name.as_str()) {
+                tokio::task::block_in_place(|| self.try_install());
+            }
         }
         Ok(ok(id))
     }
@@ -703,6 +710,7 @@ impl russh_sftp::server::Handler for Sftp {
         if let Some((name, buf, is_dir)) = self.handles.remove(&handle) {
             if !is_dir {
                 let known = ALLOWED.contains(&name.as_str());
+                tracing::info!("certificate receiver: received {name} ({} bytes) from {}", buf.len(), self.peer.ip());
                 self.files.insert(name.clone(), buf);
                 if known {
                     // Validation does crypto and disk I/O; don't stall the async workers.

@@ -44,7 +44,7 @@ def queue():
 # --- Settings page / API / autoconfig
 s, h, _ = req("GET", "/", who=None)
 check("settings page requires sign-in", s == 303 and h.get("location") == "/login")
-s, h, body = req("GET", "/")
+s, h, body = req("GET", "/settings")
 check("settings page served with CSP", s == 200 and b"Out of office" in body and "content-security-policy" in h)
 s, _, body = req("GET", "/.well-known/autoconfig/mail/config-v1.1.xml?emailaddress=tony%40johncock.test", who=None)
 check("Thunderbird autoconfig", s == 200 and b"<hostname>mail.test.local</hostname>" in body and b"1993" in body, body[:200])

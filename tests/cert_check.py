@@ -88,6 +88,14 @@ for f in ["ca.pem", "cert.pem", "fullchain.pem", "key.pem"]:
     sftp(f"put upload/{f} {f}\n")
 time.sleep(1.5)
 check("files pushed in separate sessions are installed together", served_fp() == der_fp(f"{W}/good2.crt"))
+# Uploaded under temporary names, then renamed into place
+make_cert("good3", "mail.test.local", f"{W}/ca.key", f"{W}/ca.crt")
+open(f"{W}/upload/fullchain.pem", "wb").write(open(f"{W}/good3.crt", "rb").read() + open(f"{W}/ca.crt", "rb").read())
+open(f"{W}/upload/key.pem", "wb").write(open(f"{W}/good3.key", "rb").read())
+sftp("put upload/fullchain.pem fullchain.tmp\nrename fullchain.tmp fullchain.pem\n")
+sftp("put upload/key.pem key.tmp\nrename key.tmp key.pem\n")
+time.sleep(1.5)
+check("files renamed into place are installed", served_fp() == der_fp(f"{W}/good3.crt"))
 r = sh("ssh-keyscan -T 5 -p 2222 127.0.0.1")
 check("ssh-keyscan reads the receiver's host key (OPNsense 'Test connect')", "ssh-ed25519" in r.stdout, r.stdout + r.stderr)
 

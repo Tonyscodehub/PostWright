@@ -121,11 +121,14 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr) -> Result<()>
 }
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
+const MAX_MAIL_BODY: usize = 40 * 1024 * 1024;
 
 /// Read a whole request (body size-limited).
 pub async fn read_req(req: Request<Incoming>) -> Result<Req, Resp> {
     let (parts, body) = req.into_parts();
-    let body = match Limited::new(body, MAX_BODY).collect().await {
+    // Sending mail from the browser carries attachments (as base64).
+    let limit = if parts.uri.path().starts_with("/api/v1/mail/") { MAX_MAIL_BODY } else { MAX_BODY };
+    let body = match Limited::new(body, limit).collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => return Err(text(StatusCode::PAYLOAD_TOO_LARGE, "Request too large")),
     };
@@ -161,6 +164,13 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
         return builder(StatusCode::OK)
             .header("Content-Type", "application/javascript; charset=utf-8")
             .body(Full::new(Bytes::from_static(ADMIN_JS.as_bytes())))
+            .unwrap();
+    }
+    if p == "/webmail.js" {
+        return builder(StatusCode::OK)
+            .header("Content-Type", "application/javascript; charset=utf-8")
+            .header("Cache-Control", "no-cache")
+            .body(Full::new(Bytes::from_static(WEBMAIL_JS.as_bytes())))
             .unwrap();
     }
     if p == "/settings.js" {
@@ -215,7 +225,7 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
     // Everything else uses a sign-in session: a cookie for the web pages, or a bearer
     // token for the desktop app and Mailwright.
     let user = session_user(&srv, &r, &["web", "app", "device"]).await;
-    let is_page = r.method == "GET" && (p == "/" || p == "/settings" || p == "/admin" || p == "/admin/");
+    let is_page = r.method == "GET" && (p == "/" || p == "/mail" || p == "/settings" || p == "/admin" || p == "/admin/");
     let Some(user) = user else {
         if is_page {
             let next = if p == "/" { String::new() } else { format!("?next={}", enc_path(&p)) };
@@ -223,7 +233,10 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
         }
         return json_err(StatusCode::UNAUTHORIZED, "sign in required");
     };
-    if p == "/" || p == "/settings" {
+    if p == "/" || p == "/mail" {
+        return webmail_page();
+    }
+    if p == "/settings" {
         return page(SETTINGS_HTML);
     }
     if p == "/admin" || p == "/admin/" {
@@ -242,6 +255,22 @@ async fn route(srv: Shared, peer: SocketAddr, req: Request<Incoming>) -> Resp {
         return api(&srv, user, &r, rest).await;
     }
     text(StatusCode::NOT_FOUND, "Not found")
+}
+
+/// The webmail page: like the others, but messages may show pictures from the internet
+/// once the reader asks (the message frame applies its own stricter policy first).
+fn webmail_page() -> Resp {
+    builder(StatusCode::OK)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; font-src 'self' data:; frame-src 'self' about:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+        )
+        .header("X-Frame-Options", "DENY")
+        .header("Referrer-Policy", "no-referrer")
+        .body(Full::new(Bytes::from_static(WEBMAIL_HTML.as_bytes())))
+        .unwrap()
 }
 
 fn page(html: &'static str) -> Resp {
@@ -781,6 +810,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
                 .await?;
             Ok(json(StatusCode::OK, &serde_json::json!({ "ok": true })))
         }
+        (_, ["mail", ..]) | (_, ["cal", ..]) | (_, ["contacts", ..]) => crate::webmail::api(srv, &user, r, &segs).await,
         _ => Ok(json_err(StatusCode::NOT_FOUND, "unknown endpoint")),
     }
 }
@@ -837,6 +867,8 @@ fn autoconfig(srv: &Shared, r: &Req) -> Resp {
 
 // --------------------------------------------------------------- web page
 
+const WEBMAIL_HTML: &str = include_str!("web/webmail.html");
+const WEBMAIL_JS: &str = include_str!("web/webmail.js");
 const SETTINGS_HTML: &str = include_str!("web/settings.html");
 pub const MIGRATE_JS: &str = include_str!("web/migrate.js");
 const LOGIN_HTML: &str = include_str!("web/login.html");

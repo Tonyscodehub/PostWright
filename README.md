@@ -11,6 +11,7 @@ One binary provides:
 - **Out-of-office auto-replies** and **server-stored signatures**
 - **Two-step verification** with any authenticator app (QR code set-up), plus app passwords and recovery codes
 - **Shared mailboxes and delegation**: open other people's mailboxes, and **send on behalf of** or **send as** them
+- **Webmail** at `https://your-server/`: mail, calendar, and contacts in any browser, on desktop or phone
 - **A settings web page and JSON API**, plus Thunderbird-style **autoconfig**
 - **An admin console**, both in the browser at `/admin` and as a Windows desktop app (**Postwright Admin**)
 - An **outbound queue** with MX failover, retries with back-off, and bounce reports
@@ -264,6 +265,34 @@ Not imported:
 - SOGo contacts (export them from SOGo as .vcf and import them on the settings page)
 - mlmmj list archives (list members do become aliases)
 - Sieve filter rules
+
+## Webmail
+
+Users sign in at `https://your-server/` with their email address and password (and their two-step code, if they've turned that on). It works on desktop and phone browsers, and everything in it is the same mailbox, calendar, and contacts that Outlook, phones, and Thunderbird see, so changes show up everywhere straight away.
+
+- **Mail:**
+  - folders with unread counts, searching, and an unread-only filter;
+  - reading with attachments;
+  - writing with formatting, attachments (drag and drop, up to 25 MB), Cc/Bcc, and address suggestions from your contacts and the Directory;
+  - replying, replying to all, and forwarding (with the original attachments);
+  - drafts, saved automatically every minute;
+  - moving (or dragging onto a folder), Junk, flags, read/unread, deleting, and downloading as `.eml`;
+  - creating, renaming, and deleting folders;
+  - sending from your aliases, and **as** or **on behalf of** someone who has given you that right.
+- **Calendar:** day, week, and month views across your own and shared calendars.
+  - Create, edit, and delete events, including all-day and repeating ones; delete a single occurrence or the whole series.
+  - **Invite people.** They get a standard invitation that works in Outlook, Apple Calendar, Gmail, and Postwright. Their answers update your copy of the event, and deleting the meeting tells them it's cancelled.
+  - Invitations you receive show **Accept / Maybe / Decline**, which add the event to your calendar and tell the organiser.
+- **Contacts:** browse and search all your address books (including the Directory), and add, edit, or delete contacts.
+- **Keyboard shortcuts** in mail: `n` new, `r` reply, `a` reply all, `f` forward, `Delete`, and `j`/`k` (or the arrow keys) for the next and previous message.
+
+**Safety:**
+- Messages are shown in a sandboxed frame where scripts can't run.
+- Pictures from the internet (often used to track opening) are hidden until you click **Show pictures**, and are never shown for mail in Junk.
+- Attachments always download rather than open in the page, apart from images and PDFs.
+- Mail sent from the browser gets the same treatment as mail from an email app: sender checks, outbound virus and spam scanning, your server-side signature, DKIM signing, and a copy in **Sent**.
+
+The settings page (out of office, signature, two-step verification, app passwords, sharing) is at `/settings`, linked from the menu under your name.
 
 ## Out of office
 

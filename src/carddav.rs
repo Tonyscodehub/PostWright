@@ -309,7 +309,7 @@ pub fn count(c: &Connection, book_id: i64) -> Result<i64> {
     Ok(c.query_row("SELECT COUNT(*) FROM contacts WHERE addressbook_id = ?1", [book_id], |r| r.get(0))?)
 }
 
-fn list_cards(c: &Connection, user: &User, book: &Book, scope: &str) -> Result<Vec<Card>> {
+pub(crate) fn list_cards(c: &Connection, user: &User, book: &Book, scope: &str) -> Result<Vec<Card>> {
     if book.directory {
         return directory_cards(c, user, scope);
     }
@@ -318,7 +318,7 @@ fn list_cards(c: &Connection, user: &User, book: &Book, scope: &str) -> Result<V
     Ok(v)
 }
 
-fn get_card(c: &Connection, user: &User, book: &Book, name: &str, scope: &str) -> Result<Option<Card>> {
+pub(crate) fn get_card(c: &Connection, user: &User, book: &Book, name: &str, scope: &str) -> Result<Option<Card>> {
     if book.directory {
         return Ok(directory_cards(c, user, scope)?.into_iter().find(|x| x.name == name));
     }

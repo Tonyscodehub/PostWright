@@ -224,7 +224,7 @@ pub fn get_object(c: &Connection, cal_id: i64, name: &str) -> Result<Option<Obj>
         .optional()?)
 }
 
-fn bump(c: &Connection, cal_id: i64) -> Result<()> {
+pub(crate) fn bump(c: &Connection, cal_id: i64) -> Result<()> {
     c.execute("UPDATE calendars SET ctag = ctag + 1 WHERE id = ?1", [cal_id])?;
     Ok(())
 }

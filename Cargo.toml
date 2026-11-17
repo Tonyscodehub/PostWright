@@ -1,6 +1,6 @@
 [package]
 name = "postwright"
-version = "0.5.8"
+version = "0.6.0"
 edition = "2021"
 description = "Secure, multi-domain SMTP + IMAP mail server written in Rust"
 license = "MIT"

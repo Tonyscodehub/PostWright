@@ -21,6 +21,7 @@ mod server;
 mod service;
 mod setup;
 mod upgrade;
+mod webmail;
 mod smtp;
 mod store;
 mod xml;
