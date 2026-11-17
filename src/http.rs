@@ -420,6 +420,10 @@ fn forget_cached_logins(user_id: i64) {
 
 /// Drop cached logins for an account (after an admin changes or removes it). Cached
 /// entries are keyed by credential hash, so clear any for this address's user id.
+pub fn forget_all_cached_logins() {
+    auth_cache().lock().unwrap().clear();
+}
+
 pub fn forget_cached_logins_for(_email: &str) {
     // Entries expire within five minutes anyway; clearing all is cheap and simplest.
     auth_cache().lock().unwrap().clear();
@@ -522,8 +526,12 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
         }
         // ---------------------------------------------------- two-factor authentication
         ("GET", ["mfa"]) => {
-            let st = srv.store.call(move |c| identity::status(c, uid)).await?;
-            Ok(json(StatusCode::OK, &st))
+            let (st, radius) = srv.store.call(move |c| Ok((identity::status(c, uid)?, crate::radius::applies(c, uid)?))).await?;
+            let mut v = serde_json::to_value(&st)?;
+            // Codes come from the organisation's authentication server for this user.
+            v["radius"] = serde_json::json!(radius);
+            v["radius_mail_password"] = serde_json::json!(crate::radius::current().map(|c| c.mail_apps_keep_password).unwrap_or(false));
+            Ok(json(StatusCode::OK, &v))
         }
         ("POST", ["mfa", "setup"]) => {
             let issuer = srv.cfg.hostname.clone();

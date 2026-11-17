@@ -417,6 +417,26 @@ To insist that administrators use it, set `require_mfa_for_admins = true` under 
 
 Codes are checked with ±30 seconds of clock drift allowed, and each code can be used only once. Secrets are generated on the server and never leave it after set-up. Recovery codes and app passwords are stored only as hashes.
 
+### Codes from a RADIUS server (multiOTP, LinOTP and others)
+
+Instead of each user enrolling here, two-step codes can be checked by your own authentication server over RADIUS, so one authenticator-app token can protect mail as well as other things that server covers (OpenVPN on OPNsense, Windows or RDP sign-in). This works with **multiOTP** (which runs on Windows, alongside Postwright), LinOTP, privacyIDEA, and FreeRADIUS.
+
+Set it up on the console's **Two-step sign-in** page (browser or desktop app):
+
+1. **On the RADIUS server:** add Postwright's address as a RADIUS client with a shared secret, and give each person a TOTP token. In multiOTP: create the user, then scan the token's QR code with Microsoft or Google Authenticator. See multiOTP's guide "How to install the multiOTP radius server under Windows". Allow UDP port 1812 through that server's firewall.
+2. **In the console:** tick **Use a RADIUS server for two-step codes**, enter the server (for example `127.0.0.1:1812` when it runs on the same machine) and the shared secret, and choose:
+   - **Name sent to the server:** the full email address, or just the part before `@`, whichever matches the user names on the RADIUS server.
+   - **Sent as the password:** the code only, or the password followed by the code, for servers set up with a PIN or password prefix.
+   - **Who it applies to:** only the users you tick on the same page, which lets you move people over gradually, or everyone.
+3. **Test with a real code:** enter a user and the code their app shows. It reports whether the server accepted it, refused it (the connection and secret are working), or couldn't be reached (with what to check). The test uses the settings as entered, before you save.
+4. **Save.** It takes effect immediately.
+
+For the people it applies to, the web pages, the console, and the desktop app ask for a code, which is checked with the RADIUS server. As with built-in two-step verification, mail apps then need an **app password**. You can temporarily allow the account password for mail apps while people move over, but that's less secure.
+
+**If the RADIUS server is down**, sign-in is refused rather than let through without a code. Postwright's own recovery codes, and any authenticator app a user has also set up in Postwright, still work, so an administrator with those can always get in to switch RADIUS off. RADIUS sign-in can also be turned off by removing the `[radius]` section from the settings (`postwright config export`, edit, `postwright config import`).
+
+Requests carry a Message-Authenticator, and replies are checked against the shared secret, so a forged "accept" is refused. This is compatible with RADIUS servers updated for the 2024 "BlastRADIUS" fixes. Challenge-based methods (SMS or push codes that need a second round) aren't supported yet: use authenticator-app (TOTP) tokens.
+
 ### Mailwright token sign-in
 
 Mailwright can sign in once with the password and code, then use a long-lived **device token** for IMAP, SMTP and CalDAV, so the user never needs an app password for it:

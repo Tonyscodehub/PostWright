@@ -21,6 +21,7 @@ enum Page {
     Aliases,
     Queue,
     Filters,
+    TwoStep,
     Certificate,
     Import,
     Logs,
@@ -35,6 +36,7 @@ const PAGES: &[(Page, &str)] = &[
     (Page::Aliases, "Aliases"),
     (Page::Queue, "Mail queue"),
     (Page::Filters, "Spam & antivirus"),
+    (Page::TwoStep, "Two-step sign-in"),
     (Page::Certificate, "Certificate"),
     (Page::Import, "Import from iRedMail"),
     (Page::Logs, "Logs"),
@@ -48,6 +50,7 @@ enum Msg {
     Dns(String, Result<Value, String>),
     Alerts(Result<Value, String>),
     Tested(Result<Value, String>),
+    RadiusTested(Result<Value, String>),
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -184,6 +187,11 @@ struct App {
     aliases: Vec<Value>,
     queue: Vec<Value>,
     filters: Option<Value>,
+    twostep: Option<Value>,
+    /// RADIUS settings being edited, whether it's on, the secret typed, and the tester.
+    radius_edit: Option<(bool, Value)>,
+    radius_secret: String,
+    radius_test: (String, String, Option<Value>),
     certs: Option<Value>,
     cert_key_line: String,
     cert_chain: String,
@@ -294,6 +302,10 @@ impl App {
             alerts: Vec::new(),
             last_alerts: None,
             filter_edit: None,
+            twostep: None,
+            radius_edit: None,
+            radius_secret: String::new(),
+            radius_test: (String::new(), String::new(), None),
             filter_test: None,
         }
     }
@@ -339,6 +351,7 @@ impl App {
             Page::Aliases => "aliases".into(),
             Page::Queue => "queue".into(),
             Page::Filters => "filters".into(),
+            Page::TwoStep => "two-step".into(),
             Page::Certificate => "certs".into(),
             Page::Import => "import".into(),
             Page::Logs => format!("logs?n=800&q={}", seg(&self.log_filter)),
@@ -382,6 +395,13 @@ impl App {
                 self.busy = self.busy.saturating_sub(1);
                 if let Ok(v) = r {
                     self.alerts = v["alerts"].as_array().cloned().unwrap_or_default();
+                }
+            }
+            Msg::RadiusTested(r) => {
+                self.busy = self.busy.saturating_sub(1);
+                match r {
+                    Ok(v) => self.radius_test.2 = Some(v),
+                    Err(e) => self.error(e),
                 }
             }
             Msg::Tested(r) => {
@@ -443,6 +463,15 @@ impl App {
                             Page::Migration => self.migration = Some(v.clone()),
                             Page::Aliases => self.aliases = arr(),
                             Page::Queue => self.queue = arr(),
+                            Page::TwoStep => {
+                                let mut st = if v["settings"].is_null() { v["defaults"].clone() } else { v["settings"].clone() };
+                                if let Some(o) = st.as_object_mut() {
+                                    o.remove("secret_set");
+                                }
+                                st["secret"] = json!("");
+                                self.radius_edit = Some((v["enabled"].as_bool().unwrap_or(false), st));
+                                self.twostep = Some(v.clone());
+                            }
                             Page::Filters => {
                                 self.filter_edit = Some(v["settings"].clone());
                                 self.filters = Some(v.clone());
@@ -1461,6 +1490,124 @@ impl App {
         }
     }
 
+    fn twostep_view(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let (Some(d), Some((mut on, mut st))) = (self.twostep.clone(), self.radius_edit.clone()) else {
+            self.header(ui, "Two-step sign-in", "");
+            return;
+        };
+        self.header(ui, "Two-step sign-in", &format!("Changes take effect as soon as you save. They're kept in {}.", s(&d["saved_in"])));
+        let secret_set = d["settings"]["secret_set"].as_bool().unwrap_or(false);
+        card(ui, "Codes checked by a RADIUS server", |ui| {
+            ui.label("Send the second step of sign-in (webmail, settings, the admin console and this app) to a RADIUS server such as multiOTP, which runs on Windows. One authenticator-app token can then also protect your VPN or Windows sign-in.");
+            ui.checkbox(&mut on, "Use a RADIUS server for two-step codes");
+            if !on {
+                ui.label(RichText::new("Off: two-step verification uses Postwright's built-in authenticator-app codes, which each user turns on in their settings.").small());
+                return;
+            }
+            egui::Grid::new("radius").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                for (k, l, hint) in [("server", "RADIUS server", "192.168.1.72:1812"), ("backup_server", "Backup server (optional)", "")] {
+                    ui.label(l);
+                    let mut v = s(&st[k]);
+                    if ui.add(egui::TextEdit::singleline(&mut v).hint_text(hint).desired_width(260.0)).changed() {
+                        st[k] = json!(v.trim());
+                    }
+                    ui.end_row();
+                }
+                ui.label("Shared secret");
+                ui.add(egui::TextEdit::singleline(&mut self.radius_secret).password(true).hint_text(if secret_set { "(unchanged: type to replace)" } else { "same as on the RADIUS server" }).desired_width(260.0));
+                ui.end_row();
+                for (k, l, opts) in [
+                    ("username", "Name sent", vec![("email", "Full email address"), ("local", "Just the name before @")]),
+                    ("send", "Sent as the password", vec![("code", "The code only"), ("password+code", "Password followed by the code")]),
+                    ("users", "Who it applies to", vec![("selected", "Only the users ticked below"), ("all", "Everyone")]),
+                ] {
+                    ui.label(l);
+                    let mut v = s(&st[k]);
+                    egui::ComboBox::from_id_salt(k).selected_text(opts.iter().find(|o| o.0 == v).map(|o| o.1).unwrap_or("")).show_ui(ui, |ui| {
+                        for (val, label) in &opts {
+                            ui.selectable_value(&mut v, val.to_string(), *label);
+                        }
+                    });
+                    st[k] = json!(v);
+                    ui.end_row();
+                }
+                ui.label("Timeout (seconds)");
+                let mut t = st["timeout_secs"].as_u64().unwrap_or(5);
+                if ui.add(egui::DragValue::new(&mut t).range(1..=30)).changed() {
+                    st["timeout_secs"] = json!(t);
+                }
+                ui.end_row();
+            });
+            let mut keep = st["mail_apps_keep_password"].as_bool().unwrap_or(false);
+            if ui.checkbox(&mut keep, "Mail apps may keep using the account password (less secure)").changed() {
+                st["mail_apps_keep_password"] = json!(keep);
+            }
+        });
+        ui.add_space(8.0);
+        let mut payload = st.clone();
+        payload["secret"] = json!(self.radius_secret);
+        if ui.add(egui::Button::new(RichText::new("Save").strong()).min_size(egui::vec2(90.0, 30.0))).clicked() {
+            if on && self.radius_secret.is_empty() && !secret_set {
+                self.toast("Enter the shared secret", false);
+            } else {
+                let body = json!({ "enabled": on, "settings": if on { payload.clone() } else { Value::Null } });
+                self.action(&ctx, "PUT", "two-step".into(), body, Page::TwoStep, "Saved: in use now");
+                self.radius_secret.clear();
+            }
+        }
+        if on {
+            ui.add_space(8.0);
+            card(ui, "Test with a real code", |ui| {
+                ui.label(RichText::new("Uses the settings as entered above, before you save.").small());
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.radius_test.0).hint_text("user@yourdomain").desired_width(200.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.radius_test.1).hint_text("123456").desired_width(80.0));
+                    if ui.button("Test").clicked() {
+                        let body = json!({ "email": self.radius_test.0, "code": self.radius_test.1, "settings": payload.clone() });
+                        self.radius_test.2 = None;
+                        self.spawn(&ctx, move |c| Msg::RadiusTested(c.send("POST", "two-step/test", &body)));
+                    }
+                });
+                if let Some(r) = &self.radius_test.2 {
+                    ui.horizontal_wrapped(|ui| {
+                        let (t, tone) = match r["result"].as_str() {
+                            Some("accepted") => ("Accepted", Tone::Good),
+                            Some("rejected") => ("Refused", Tone::Warn),
+                            _ => ("Problem", Tone::Bad),
+                        };
+                        pill(ui, t, tone);
+                        ui.label(s(&r["detail"]));
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            let all = st["users"] == "all";
+            card(ui, if all { "Users (everyone uses the RADIUS server)" } else { "Users who use the RADIUS server" }, |ui| {
+                ui.label(RichText::new("Give each person a token on the RADIUS server first, then tick them here. Their Postwright recovery codes, and any authenticator app set up in Postwright, still work if the server is down.").small());
+                egui::Grid::new("radius-users").num_columns(3).spacing([24.0, 6.0]).show(ui, |ui| {
+                    for u in d["users"].as_array().cloned().unwrap_or_default() {
+                        let email = s(&u["email"]);
+                        ui.label(&email);
+                        let mut sel = all || u["selected"].as_bool().unwrap_or(false);
+                        let resp = ui.add_enabled(!all, egui::Checkbox::new(&mut sel, "RADIUS"));
+                        if resp.changed() {
+                            let msg = if sel { format!("{email} now uses the RADIUS server") } else { format!("{email} no longer uses the RADIUS server") };
+                            self.action(&ctx, "PUT", "two-step/users".into(), json!({ "email": email, "selected": sel }), Page::TwoStep, &msg);
+                        }
+                        if u["builtin"].as_bool().unwrap_or(false) {
+                            pill(ui, "Built-in codes on", Tone::Good);
+                        } else {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        }
+        self.radius_edit = Some((on, st));
+    }
+
     fn cert_view(&mut self, ui: &mut egui::Ui) {
         self.header(ui, "Certificate", "Renewed certificates are picked up automatically: pushed by OPNsense, or copied into place any other way.");
         let ctx = ui.ctx().clone();
@@ -1780,6 +1927,7 @@ impl eframe::App for App {
                     Page::Aliases => self.aliases_view(ui),
                     Page::Queue => self.queue_view(ui),
                     Page::Filters => self.filters_view(ui),
+                    Page::TwoStep => self.twostep_view(ui),
                     Page::Certificate => self.cert_view(ui),
                     Page::Import => self.import_view(ui),
                     Page::Logs => self.logs_view(ui),

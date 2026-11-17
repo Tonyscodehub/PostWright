@@ -404,6 +404,74 @@ async function filters() {
     h("div", { class: "row" }, save));
 }
 
+// ------------------------------------------------------------- two-step sign-in
+async function twostep() {
+  const d = await api("GET", "two-step");
+  const st = d.settings ? { ...d.settings } : { ...d.defaults };
+  delete st.secret_set;
+  let enabled = d.enabled;
+  const field = (label, el, hint) => h("div", { class: "field" }, h("label", {}, label), el, hint ? h("div", { class: "muted small" }, hint) : null);
+  const text = (k, ph, type = "text") => { const i = h("input", { type, value: st[k] || "", placeholder: ph }); i.oninput = () => { st[k] = i.value.trim(); }; return i; };
+  const select = (k, opts) => { const s = h("select", {}, opts.map(([v, l]) => h("option", { value: v }, l))); s.value = st[k]; s.onchange = () => { st[k] = s.value; render(); }; return s; };
+  const on = h("input", { type: "checkbox" }); on.checked = enabled; on.onchange = () => { enabled = on.checked; render(); };
+  const keep = h("input", { type: "checkbox" }); keep.checked = !!st.mail_apps_keep_password; keep.onchange = () => { st.mail_apps_keep_password = keep.checked; };
+  const timeout = h("input", { type: "number", min: 1, max: 30, value: st.timeout_secs }); timeout.oninput = () => { st.timeout_secs = parseInt(timeout.value || "5", 10); };
+  const secret = h("input", { type: "password", value: "", placeholder: d.settings && d.settings.secret_set ? "(unchanged: type to replace)" : "the same secret set on the RADIUS server", autocomplete: "new-password" });
+  secret.oninput = () => { st.secret = secret.value; };
+  st.secret = "";
+
+  const testEmail = h("input", { type: "email", value: "", placeholder: "user@yourdomain" });
+  const testCode = h("input", { type: "text", inputmode: "numeric", placeholder: "123456", maxlength: 12 });
+  const testPw = h("input", { type: "password", placeholder: "their password (only if sending password + code)" });
+  const testOut = h("div");
+  const users = h("tbody");
+  const box = h("div");
+
+  const render = () => {
+    const form = enabled ? [
+      h("div", { class: "form" },
+        field("RADIUS server", text("server", "192.168.1.72:1812"), "multiOTP, LinOTP, privacyIDEA or FreeRADIUS. Port 1812 unless you changed it."),
+        field("Backup server (optional)", text("backup_server", "")),
+        field("Shared secret", secret, "Must match the client entry for this server on the RADIUS server."),
+        field("Name sent to the server", select("username", [["email", "Full email address (tony@example.com)"], ["local", "Just the name before @ (tony)"]])),
+        field("Sent as the password", select("send", [["code", "The code only"], ["password+code", "Password followed by the code"]]), "Use the second if the server is set up with a PIN or password prefix."),
+        field("Who it applies to", select("users", [["selected", "Only the users ticked below"], ["all", "Everyone"]])),
+        field("Timeout (seconds)", timeout),
+        h("div", { class: "field" }, h("label", { class: "c" }, keep, "Mail apps may keep using the account password"),
+          h("div", { class: "muted small" }, "Off (recommended): people this applies to need an app password for Outlook, phones and Thunderbird, as with built-in two-step verification. On: easier while people move over, but less secure."))),
+    ] : [h("p", { class: "muted" }, "Off: two-step verification uses Postwright's built-in authenticator-app codes, which each user turns on in their settings.")];
+    const tester = enabled ? h("div", { class: "card" }, h("h3", {}, "Test with a real code"),
+      h("p", { class: "muted small" }, "Uses the settings as entered above, before you save. Enter a user who has a token on the RADIUS server and the code their app shows now."),
+      h("div", { class: "row" }, testEmail, testCode, st.send === "password+code" ? testPw : null,
+        h("button", { class: "ghost", onclick: async () => {
+          testOut.replaceChildren(h("p", { class: "muted" }, "Asking the server…"));
+          try {
+            const r = await api("POST", "two-step/test", { email: testEmail.value, code: testCode.value, password: testPw.value, settings: st });
+            testOut.replaceChildren(h("p", {}, pill(r.result === "accepted" ? "Accepted" : r.result === "rejected" ? "Refused" : "Problem", r.ok ? "ok" : r.result === "rejected" ? "warn" : "err"), " ", r.detail));
+          } catch (e) { testOut.replaceChildren(h("p", { class: "err" }, e.message)); }
+        } }, "Test")), testOut) : null;
+    const who = enabled ? h("div", { class: "card" }, h("h3", {}, st.users === "all" ? "Users (everyone uses the RADIUS server)" : "Users who use the RADIUS server"),
+      h("p", { class: "muted small" }, "Give each person a token on the RADIUS server first (in multiOTP: create the user, then scan its QR code in Microsoft or Google Authenticator), then tick them here. Their Postwright recovery codes, and any authenticator app they set up in Postwright, still work as a way in if the server is down."),
+      h("table", {}, h("tr", {}, h("th", {}, "User"), h("th", {}, "RADIUS"), h("th", {}, "Built-in codes")), users)) : null;
+    users.replaceChildren(...d.users.map((u) => {
+      const c = h("input", { type: "checkbox" }); c.checked = st.users === "all" || u.selected; c.disabled = st.users === "all";
+      c.onchange = () => act(async () => { await api("PUT", "two-step/users", { email: u.email, selected: c.checked }); u.selected = c.checked; }, c.checked ? `${u.email} now uses the RADIUS server` : `${u.email} no longer uses the RADIUS server`);
+      return h("tr", {}, h("td", {}, u.email, u.admin ? " " : "", u.admin ? pill("admin", "info") : ""), h("td", {}, c), h("td", {}, u.builtin ? pill("On", "ok") : h("span", { class: "muted" }, "Off")));
+    }));
+    box.replaceChildren(
+      h("div", { class: "card" }, h("h3", {}, "Codes checked by a RADIUS server"),
+        h("p", { class: "muted small" }, "Send the second step of sign-in (webmail, settings, the admin console and the desktop app) to a RADIUS server such as multiOTP, which runs on Windows. One authenticator-app token can then also protect your VPN or Windows sign-in."),
+        h("label", { class: "c" }, on, "Use a RADIUS server for two-step codes"), ...form,
+        h("div", { class: "row", style: "margin-top:12px" }, h("button", { onclick: () => act(async () => {
+          if (enabled && !st.secret && !(d.settings && d.settings.secret_set)) throw new Error("Enter the shared secret");
+          await api("PUT", "two-step", { enabled, settings: enabled ? st : null });
+        }, "Saved: in use now") }, "Save"))),
+      tester, who);
+  };
+  render();
+  page("Two-step sign-in", "Changes take effect as soon as you save. They're kept in " + (d.saved_in || "the settings") + ".", box);
+}
+
 // ------------------------------------------------------------------- alerts
 async function refreshAlerts() {
   try {
@@ -521,7 +589,7 @@ async function migratePage() {
 }
 
 // -------------------------------------------------------------------- router
-const pages = { overview, domains, users, access, migration: migratePage, aliases, queue, filters, certificate, import: importPage, logs };
+const pages = { overview, domains, users, access, migration: migratePage, aliases, queue, filters, twostep, certificate, import: importPage, logs };
 async function route() {
   clearTimeout(timer);
   if (migration) { migration.stop(); migration = null; }

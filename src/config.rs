@@ -21,6 +21,9 @@ pub struct Config {
     pub filter: crate::filter::FilterConfig,
     pub certs: crate::certs::CertConfig,
     pub contacts: ContactsConfig,
+    /// Two-step codes checked by an external RADIUS server (multiOTP, LinOTP...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius: Option<crate::radius::RadiusConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +135,7 @@ impl Default for Config {
             filter: crate::filter::FilterConfig::default(),
             certs: crate::certs::CertConfig::default(),
             contacts: ContactsConfig::default(),
+            radius: None,
         }
     }
 }

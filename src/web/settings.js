@@ -257,8 +257,17 @@ function showCodes(codes) {
 
 async function loadMfa() {
   const st = await call("GET", "mfa");
-  $("mfa-badge").textContent = st.enabled ? "On" : "Off";
-  $("mfa-badge").className = "badge" + (st.enabled ? " on" : "");
+  const on = st.enabled || st.radius;
+  $("mfa-badge").textContent = on ? "On" : "Off";
+  $("mfa-badge").className = "badge" + (on ? " on" : "");
+  $("mfa-radius").classList.toggle("hidden", !st.radius);
+  if (st.radius) {
+    $("mfa-radius").textContent = "Your organisation checks your sign-in codes with its own authentication server (such as multiOTP), "
+      + "so use the authenticator app token your administrator set up for you. "
+      + (st.radius_mail_password ? "Mail apps can still use your password for now." : "Mail apps need an app password (below).")
+      + (st.enabled ? " Codes from the app set up here, and your recovery codes, also work." : "");
+  }
+  $("mfa-start").textContent = st.radius ? "Optional: set up a backup authenticator app here" : "Set up an authenticator app";
   $("mfa-off").classList.toggle("hidden", st.enabled);
   $("mfa-on").classList.toggle("hidden", !st.enabled);
   if (st.enabled) {

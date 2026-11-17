@@ -18,6 +18,7 @@ mod migrate;
 mod admin;
 mod net;
 mod prefs;
+mod radius;
 mod server;
 mod service;
 mod setup;

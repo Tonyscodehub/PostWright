@@ -39,6 +39,7 @@ impl Server {
             .map_err(|e| anyhow::anyhow!("DNS resolver: {e}"))?;
         let (changes, _) = broadcast::channel(1024);
         let filter = RwLock::new(Arc::new(cfg.filter.clone()));
+        crate::radius::set(cfg.radius.clone());
         Ok(Arc::new(Self { cfg, store, tls: RwLock::new(tls), guard, dns, changes, queue_wake: Notify::new(), filter }))
     }
 

@@ -69,7 +69,7 @@ pub async fn handle(srv: &Shared, peer: IpAddr, user: User, r: &Req, rest: &str)
     }
     if srv.cfg.security.require_mfa_for_admins {
         let uid = user.id;
-        if !srv.store.call(move |c| crate::identity::enabled(c, uid)).await.unwrap_or(false) {
+        if !srv.store.call(move |c| Ok(crate::identity::enabled(c, uid)? || crate::radius::applies(c, uid)?)).await.unwrap_or(false) {
             return json_err(
                 StatusCode::FORBIDDEN,
                 "this server requires administrators to use two-factor authentication: turn it on in your account settings first",
@@ -536,6 +536,112 @@ pub(crate) async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Resul
             Ok(j!({ "ok": true }))
         }
         ("GET", ["alerts"]) => Ok(j!({ "alerts": crate::hold::alerts(srv).await })),
+
+        // ------------------------------------------------- two-step sign-in (RADIUS)
+        ("GET", ["two-step"]) => {
+            let cur = crate::radius::current();
+            let users = srv
+                .store
+                .call(|c| {
+                    let sel = crate::radius::selected(c)?;
+                    let mut out = Vec::new();
+                    for u in store::list_users(c)? {
+                        out.push(j!({ "email": u.email, "selected": sel.contains(&u.id), "builtin": crate::identity::enabled(c, u.id)?, "admin": u.is_admin }));
+                    }
+                    Ok(out)
+                })
+                .await?;
+            // The shared secret never goes back to the browser.
+            let settings = cur.as_deref().map(|c| {
+                let mut v = serde_json::to_value(c).unwrap_or_default();
+                v["secret"] = j!("");
+                v["secret_set"] = j!(!c.secret.is_empty());
+                v
+            });
+            Ok(j!({ "enabled": cur.is_some(), "settings": settings, "defaults": crate::radius::RadiusConfig::default(), "users": users,
+                    "saved_in": crate::configloc::ACTIVE.get().map(|l| l.describe()) }))
+        }
+        ("PUT", ["two-step"]) => {
+            #[derive(Deserialize)]
+            struct Put {
+                enabled: bool,
+                #[serde(default)]
+                settings: Option<crate::radius::RadiusConfig>,
+            }
+            let p: Put = body(r)?;
+            let new = if p.enabled {
+                let mut s = p.settings.ok_or_else(|| anyhow::anyhow!("fill in the RADIUS settings"))?;
+                if s.secret.is_empty() {
+                    s.secret = crate::radius::current().map(|c| c.secret.clone()).unwrap_or_default();
+                }
+                crate::radius::validate(&s)?;
+                Some(s)
+            } else {
+                None
+            };
+            let loc = crate::configloc::ACTIVE.get().ok_or_else(|| anyhow::anyhow!("settings location unknown"))?;
+            let value = new.as_ref().map(toml::Value::try_from).transpose()?;
+            crate::setup::edit_config(loc, |t| match value {
+                Some(v) => {
+                    t.insert("radius".into(), v);
+                }
+                None => {
+                    t.remove("radius");
+                }
+            })?;
+            crate::radius::set(new);
+            crate::http::forget_all_cached_logins();
+            tracing::info!("admin {} changed two-step sign-in (RADIUS {})", me.email, if p.enabled { "on" } else { "off" });
+            Ok(j!({ "ok": true }))
+        }
+        ("POST", ["two-step", "test"]) => {
+            #[derive(Deserialize)]
+            struct T {
+                email: String,
+                code: String,
+                #[serde(default)]
+                password: String,
+                #[serde(default)]
+                settings: Option<crate::radius::RadiusConfig>,
+            }
+            let t: T = body(r)?;
+            let mut cfg = match t.settings {
+                Some(s) => s,
+                None => (*crate::radius::current().ok_or_else(|| anyhow::anyhow!("RADIUS isn't set up"))?).clone(),
+            };
+            if cfg.secret.is_empty() {
+                cfg.secret = crate::radius::current().map(|c| c.secret.clone()).unwrap_or_default();
+            }
+            crate::radius::validate(&cfg)?;
+            let v = match crate::radius::check(&cfg, t.email.trim(), &t.password, t.code.trim()).await {
+                Ok((crate::radius::Answer::Accept, d)) => j!({ "ok": true, "result": "accepted", "detail": format!("The server accepted the code ({} ms).", d.as_millis()) }),
+                Ok((crate::radius::Answer::Reject(m), d)) => j!({ "ok": false, "result": "rejected",
+                    "detail": format!("The server answered ({} ms) but refused the code{}. The connection and shared secret are working.", d.as_millis(), m.map(|m| format!(": {m}")).unwrap_or_default()) }),
+                Ok((crate::radius::Answer::Challenge(m), _)) => j!({ "ok": false, "result": "challenge",
+                    "detail": format!("The server asked for another step{} (SMS or push). Use authenticator-app tokens for this user.", m.map(|m| format!(" ({m})")).unwrap_or_default()) }),
+                Err(e) => j!({ "ok": false, "result": "error", "detail": format!("{e:#}") }),
+            };
+            Ok(v)
+        }
+        ("PUT", ["two-step", "users"]) => {
+            #[derive(Deserialize)]
+            struct U {
+                email: String,
+                selected: bool,
+            }
+            let u: U = body(r)?;
+            let email = u.email.trim().to_ascii_lowercase();
+            let em = email.clone();
+            srv.store
+                .call(move |c| {
+                    let user = store::find_user(c, &em)?.ok_or_else(|| anyhow::anyhow!("no such user"))?;
+                    crate::radius::select(c, user.id, u.selected)
+                })
+                .await?;
+            crate::http::forget_cached_logins_for(&email);
+            tracing::info!("admin {} set RADIUS two-step for {email}: {}", me.email, u.selected);
+            Ok(j!({ "ok": true }))
+        }
         ("GET", ["import"]) => {
             let st = IMPORT.lock().unwrap().clone();
             let out = iredmail::OUTPUT.lock().unwrap().clone();

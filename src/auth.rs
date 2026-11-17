@@ -108,7 +108,7 @@ pub async fn authenticate(store: &Store, email: &str, password: &str) -> Result<
             if crate::identity::check_app_password(c, u.id, &p)? {
                 return Ok(Ok(u));
             }
-            Ok(Err(crate::identity::enabled(c, u.id)?))
+            Ok(Err(crate::identity::enabled(c, u.id)? || crate::radius::blocks_mail_password(c, u.id)?))
         })
         .await?;
     match via_app {
@@ -135,22 +135,39 @@ pub async fn web_login(store: &Store, email: &str, password: &str, code: Option<
     let Some(u) = verify_password(store, email, password).await? else { return Ok(WebLogin::Fail) };
     let code = code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
     let id = u.id;
-    let res = store
+    let code2 = code.clone();
+    // (built-in two-step on, RADIUS decides, built-in code or recovery code matched)
+    let (builtin, radius, local_ok) = store
         .call(move |c| {
-            if !crate::identity::enabled(c, id)? {
-                return Ok(Some(true));
-            }
-            match code {
-                None => Ok(None),
-                Some(code) => Ok(Some(crate::identity::verify_code(c, id, &code)?)),
-            }
+            let builtin = crate::identity::enabled(c, id)?;
+            let radius = crate::radius::applies(c, id)?;
+            let local_ok = match &code2 {
+                // Postwright's own codes (including recovery codes) always work for
+                // someone who has them: the way back in if the RADIUS server is down.
+                Some(code) if builtin => crate::identity::verify_code(c, id, code)?,
+                _ => false,
+            };
+            Ok((builtin, radius, local_ok))
         })
         .await?;
-    Ok(match res {
-        Some(true) => WebLogin::Ok(u),
-        None => WebLogin::NeedCode,
-        Some(false) => WebLogin::Fail,
-    })
+    if !builtin && !radius {
+        return Ok(WebLogin::Ok(u));
+    }
+    let Some(code) = code else { return Ok(WebLogin::NeedCode) };
+    if local_ok {
+        return Ok(WebLogin::Ok(u));
+    }
+    if radius {
+        if let Some(cfg) = crate::radius::current() {
+            match crate::radius::check(&cfg, &u.email, password, &code).await {
+                Ok((crate::radius::Answer::Accept, _)) => return Ok(WebLogin::Ok(u)),
+                Ok((crate::radius::Answer::Reject(m), _)) => tracing::info!("RADIUS refused the code for {}{}", u.email, m.map(|m| format!(": {m}")).unwrap_or_default()),
+                Ok((crate::radius::Answer::Challenge(_), _)) => tracing::warn!("RADIUS asked {} for another step, which isn't supported yet", u.email),
+                Err(e) => tracing::error!("RADIUS check for {} failed: {e:#}", u.email),
+            }
+        }
+    }
+    Ok(WebLogin::Fail)
 }
 
 /// Check the account password itself. Runs Argon2 on the blocking pool.

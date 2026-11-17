@@ -211,6 +211,7 @@ fn migrate(c: &Connection) -> Result<()> {
     c.execute_batch(crate::migrate::SCHEMA)?;
     c.execute_batch(crate::webmail::SCHEMA)?;
     c.execute_batch(crate::hold::SCHEMA)?;
+    c.execute_batch(crate::radius::SCHEMA)?;
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
