@@ -496,6 +496,21 @@ fn base(path: &str) -> String {
     path.trim_end_matches('/').rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase()
 }
 
+/// The certificate file an upload is for. A client that once saw "key.pem" as a folder
+/// (earlier versions said every unknown name was one) puts the file inside it under
+/// its local name, so a known name as the parent counts too.
+fn target(path: &str) -> String {
+    let mut parts = path.trim_end_matches('/').rsplit(['/', '\\']);
+    let last = parts.next().unwrap_or("").to_ascii_lowercase();
+    if ALLOWED.contains(&last.as_str()) {
+        return last;
+    }
+    match parts.next().map(|p| p.to_ascii_lowercase()) {
+        Some(parent) if ALLOWED.contains(&parent.as_str()) => parent,
+        _ => last,
+    }
+}
+
 fn dir_attrs() -> FileAttributes {
     let mut a = FileAttributes::empty();
     a.permissions = Some(0o040755);
@@ -608,7 +623,14 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let b = base(&path);
-        Ok(Attrs { id, attrs: match self.files.get(&b) { Some(f) => file_attrs(f.len()), None => dir_attrs() } })
+        match self.files.get(&b) {
+            Some(f) => Ok(Attrs { id, attrs: file_attrs(f.len()) }),
+            // A certificate file that hasn't been uploaded yet doesn't exist (so
+            // "put local key.pem" writes key.pem, not a file inside a folder of that
+            // name); anything else is treated as a folder so cd and mkdir work.
+            None if ALLOWED.contains(&b.as_str()) || b.ends_with(".pem") || b.ends_with(".crt") || b.ends_with(".key") => Err(StatusCode::NoSuchFile),
+            None => Ok(Attrs { id, attrs: dir_attrs() }),
+        }
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
@@ -684,7 +706,7 @@ impl russh_sftp::server::Handler for Sftp {
         }
         self.next += 1;
         let h = format!("f{}", self.next);
-        self.handles.insert(h.clone(), (base(&filename), Vec::new(), false));
+        self.handles.insert(h.clone(), (target(&filename), Vec::new(), false));
         Ok(Handle { id, handle: h })
     }
 

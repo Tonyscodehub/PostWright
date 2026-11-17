@@ -96,6 +96,15 @@ sftp("put upload/fullchain.pem fullchain.tmp\nrename fullchain.tmp fullchain.pem
 sftp("put upload/key.pem key.tmp\nrename key.tmp key.pem\n")
 time.sleep(1.5)
 check("files renamed into place are installed", served_fp() == der_fp(f"{W}/good3.crt"))
+# OPNsense's real sequence: "put -p <local temp file> <name>", one file at a time
+make_cert("good4", "mail.test.local", f"{W}/ca.key", f"{W}/ca.crt")
+open(f"{W}/sftp-upload-aaa", "wb").write(open(f"{W}/ca.crt", "rb").read())
+open(f"{W}/sftp-upload-bbb", "wb").write(open(f"{W}/good4.crt", "rb").read())
+open(f"{W}/sftp-upload-ccc", "wb").write(open(f"{W}/good4.crt", "rb").read() + open(f"{W}/ca.crt", "rb").read())
+open(f"{W}/sftp-upload-ddd", "wb").write(open(f"{W}/good4.key", "rb").read())
+r = sftp("pwd\nls\nput -p sftp-upload-aaa ca.pem\nput -p sftp-upload-bbb cert.pem\nput -p sftp-upload-ccc fullchain.pem\nput -p sftp-upload-ddd key.pem\nchmod 400 key.pem\n")
+time.sleep(1.5)
+check("OPNsense-style put from temp files installs", served_fp() == der_fp(f"{W}/good4.crt"), r.stderr + r.stdout)
 r = sh("ssh-keyscan -T 5 -p 2222 127.0.0.1")
 check("ssh-keyscan reads the receiver's host key (OPNsense 'Test connect')", "ssh-ed25519" in r.stdout, r.stdout + r.stderr)
 
