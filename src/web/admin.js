@@ -274,22 +274,146 @@ async function queue() {
 }
 
 // ------------------------------------------------------------------- filters
+const ONFAIL = [
+  ["hold", "Hold the mail here", "Accept it, keep it on this server, and scan and deliver it once the scanner is back. Administrators see a banner meanwhile."],
+  ["tempfail", "Ask the sender to try again later", "Sending servers retry for days, so nothing is lost, but mail is delayed and nothing shows here."],
+  ["accept", "Deliver without this scanner", "Mail keeps flowing unscanned while it's down."],
+];
 async function filters() {
   const f = await api("GET", "filters");
-  page("Spam & antivirus", f.enabled ? "Filtering is on." : "Filtering is off (filter.enabled = false).",
-    h("div", { class: "stats" },
-      h("div", { class: "stat" }, h("div", { class: "n" }, f.junk_score), h("div", { class: "l" }, "Junk folder at score")),
-      h("div", { class: "stat" }, h("div", { class: "n" }, f.reject_score), h("div", { class: "l" }, "Reject at score")),
-      h("div", { class: "stat" }, h("div", { class: "n" }, f.greet_pause_ms + " ms"), h("div", { class: "l" }, "Greeting pause")),
-      h("div", { class: "stat" }, h("div", { class: "n" }, f.scan_outbound ? "Yes" : "No"), h("div", { class: "l" }, "Scan outgoing mail"))),
-    h("div", { class: "card" }, h("h3", {}, "Scanners"),
-      f.scanners.length ? h("table", {}, f.scanners.map((s) => h("tr", {}, h("td", {}, s.name), h("td", {}, h("code", {}, s.address)),
-        h("td", {}, pill(s.ok ? "Responding" : "Down", s.ok ? "ok" : "err"), " ", h("span", { class: "muted" }, s.ok ? "" : s.detail)))))
-        : h("p", { class: "muted" }, "No plugins configured. Add [filter.clamav], [filter.rspamd] or [filter.spamassassin] to postwright.toml.")),
+  const st = JSON.parse(JSON.stringify(f.settings));
+  const health = Object.fromEntries(f.scanners.map((x) => [x.name, x]));
+  const det = Object.fromEntries(f.detected.map((d) => [d.name, d]));
+  const num = (v, attrs = {}) => h("input", { type: "number", step: "0.5", value: v, ...attrs });
+
+  const onFail = (obj, def) => {
+    obj.on_fail = obj.on_fail || def;
+    const name = "of" + Math.random().toString(36).slice(2);
+    return h("div", { class: "field" }, h("label", {}, "If it stops responding"),
+      h("div", { class: "radios" }, ONFAIL.map(([v, t, d]) => {
+        const r = h("input", { type: "radio", name, value: v });
+        r.checked = obj.on_fail === v;
+        r.onchange = () => { obj.on_fail = v; };
+        return h("label", {}, r, h("div", {}, t, h("br"), h("span", {}, d)));
+      })));
+  };
+
+  const scanner = (key, title, what, health_name, defaults, fields) => {
+    const box = h("div", { class: "scanner" });
+    const on = h("input", { type: "checkbox" });
+    on.checked = !!st[key];
+    const render = () => {
+      const kids = [h("h4", {}, h("label", { class: "c" }, on, title),
+        st[key] && health[health_name] ? pill(health[health_name].ok ? "Responding" : "Not responding", health[health_name].ok ? "ok" : "err") : null,
+        !st[key] && det[key] && det[key].found ? pill("Found on this server", "info") : null),
+        h("div", { class: "muted small" }, what)];
+      if (st[key]) {
+        kids.push(h("div", { class: "form" }, fields(st[key]), onFail(st[key], defaults.on_fail)));
+        if (health[health_name] && !health[health_name].ok) kids.push(h("div", { class: "muted small" }, health[health_name].detail));
+      }
+      box.replaceChildren(...kids);
+    };
+    on.onchange = () => {
+      st[key] = on.checked ? { ...defaults, ...(det[key] && det[key].found ? { [defaults.url !== undefined ? "url" : "address"]: det[key].address } : {}) } : null;
+      render();
+    };
+    render();
+    return box;
+  };
+  const text = (obj, k, label, ph) => {
+    const i = input({ value: obj[k] || "", placeholder: ph });
+    i.oninput = () => { obj[k] = i.value.trim() || (k === "controller_url" || k === "password" ? null : ""); };
+    return h("div", { class: "field" }, h("label", {}, label), i);
+  };
+  const check = (obj, k, label) => {
+    const c = h("input", { type: "checkbox" }); c.checked = !!obj[k];
+    c.onchange = () => { obj[k] = c.checked; };
+    return h("div", { class: "field" }, h("label", { class: "c" }, c, label));
+  };
+
+  const scanners = [
+    scanner("clamav", "ClamAV antivirus", "Checks every message for viruses and malware. Runs on Windows or Linux; usually 127.0.0.1:3310.", "ClamAV",
+      { address: "127.0.0.1:3310", on_fail: "hold" }, (o) => [text(o, "address", "Address", "127.0.0.1:3310")]),
+    scanner("rspamd", "Rspamd spam filter", "Scores mail for spam and learns from what users move into and out of Junk. Linux only.", "Rspamd",
+      { url: "http://127.0.0.1:11333", controller_url: null, password: null, on_fail: "accept", learn: true },
+      (o) => [text(o, "url", "Address", "http://127.0.0.1:11333"), text(o, "controller_url", "Controller (for learning)", "http://127.0.0.1:11334"), text(o, "password", "Controller password", ""), check(o, "learn", "Learn from Junk")]),
+    scanner("spamassassin", "SpamAssassin", "Scores mail for spam (spamd). Linux only.", "SpamAssassin",
+      { address: "127.0.0.1:783", on_fail: "accept", learn: false },
+      (o) => [text(o, "address", "Address", "127.0.0.1:783"), check(o, "learn", "Learn from Junk (needs spamd --allow-tell)")]),
+  ];
+
+  // General
+  const en = h("input", { type: "checkbox" }); en.checked = st.enabled; en.onchange = () => { st.enabled = en.checked; };
+  const out = h("input", { type: "checkbox" }); out.checked = st.scan_outbound; out.onchange = () => { st.scan_outbound = out.checked; };
+  const hdr = h("input", { type: "checkbox" }); hdr.checked = st.add_headers; hdr.onchange = () => { st.add_headers = hdr.checked; };
+  const junk = num(st.junk_score); junk.oninput = () => { st.junk_score = parseFloat(junk.value); };
+  const rej = num(st.reject_score); rej.oninput = () => { st.reject_score = parseFloat(rej.value); };
+  const pause = h("input", { type: "number", step: "100", value: st.greet_pause_ms }); pause.oninput = () => { st.greet_pause_ms = parseInt(pause.value || "0", 10); };
+
+  // Blocklists
+  const bl = h("tbody");
+  const drawBl = () => bl.replaceChildren(...st.dnsbl.map((d, i) => {
+    const z = input({ value: d.zone, class: "grow" }); z.oninput = () => { d.zone = z.value.trim(); };
+    const sc = num(d.score); sc.oninput = () => { d.score = parseFloat(sc.value); };
+    return h("tr", {}, h("td", {}, z), h("td", {}, sc), h("td", {}, h("button", { class: "danger", onclick: () => { st.dnsbl.splice(i, 1); drawBl(); } }, "Remove")));
+  }));
+  drawBl();
+
+  const results = h("div");
+  const save = h("button", { onclick: async () => {
+    save.disabled = true;
+    try { await api("PUT", "filters", st); toast("Saved: in use now, no restart needed"); refreshAlerts(); setTimeout(filters, 400); }
+    catch (e) { toast(e.message, false); }
+    finally { save.disabled = false; }
+  } }, "Save");
+  const test = h("button", { class: "ghost", onclick: async () => {
+    test.disabled = true; results.replaceChildren(h("p", { class: "muted" }, "Testing…"));
+    try {
+      const r = await api("POST", "filters/test", st);
+      results.replaceChildren(r.results.length ? h("table", {}, r.results.map((x) => h("tr", {}, h("td", {}, x.name), h("td", {}, pill(x.ok ? "Working" : "Problem", x.ok ? "ok" : "err"), " ", x.detail))))
+        : h("p", { class: "muted" }, "Turn on a scanner first."));
+    } catch (e) { results.replaceChildren(h("p", { class: "err" }, e.message)); }
+    finally { test.disabled = false; }
+  } }, "Test scanners");
+
+  const held = f.held.length ? h("div", { class: "card note" }, h("h3", {}, `Held for scanning (${f.held.length})`),
+    h("p", { class: "muted" }, "Delivered automatically once scanning works again. Releasing sends a message on without scanning it."),
+    h("div", { class: "row" }, h("button", { class: "ghost", onclick: () => act(async () => { const r = await api("POST", "held/retry", {}); filters(); return r; }, "Checked again") }, "Try scanning now")),
+    h("div", { class: "scroll" }, h("table", {}, h("tr", {}, h("th", {}, "Held"), h("th", {}, "From"), h("th", {}, "To"), h("th", {}, "Subject"), h("th", {}, "Waiting for"), h("th", {}, "")),
+      f.held.map((m) => h("tr", {}, h("td", {}, fmtTime(m.received)), h("td", {}, (m.direction === "out" ? "↑ " : "↓ ") + (m.from || "(none)")),
+        h("td", {}, (m.to || []).join(", ")), h("td", {}, m.subject), h("td", { class: "muted" }, m.waiting_for),
+        h("td", {}, h("div", { class: "row" },
+          h("button", { class: "ghost", onclick: () => confirm("Deliver this message without scanning it?") && act(async () => { await api("POST", `held/${m.id}/release`, {}); filters(); }, "Released") }, "Release"),
+          h("button", { class: "danger", onclick: () => confirm("Delete this message? It won't be delivered.") && act(async () => { await api("DELETE", `held/${m.id}`); filters(); }, "Deleted") }, "Delete")))))))) : null;
+
+  page("Spam & antivirus", "Changes take effect as soon as you save. They're kept in " + (f.saved_in || "the settings") + ".",
+    held,
+    h("div", { class: "card" }, h("h3", {}, "Scanners"), scanners, h("div", { class: "row" }, test), results),
+    h("div", { class: "card" }, h("h3", {}, "Built-in checks"),
+      h("div", { class: "form" },
+        h("div", { class: "field" }, h("label", { class: "c" }, en, "Filter mail (built-in checks and the scanners above)")),
+        h("div", { class: "field" }, h("label", { class: "c" }, out, "Also scan mail your users send")),
+        h("div", { class: "field" }, h("label", { class: "c" }, hdr, "Add X-Spam headers to delivered mail")),
+        h("div", { class: "field" }, h("label", {}, "File in Junk at score"), junk),
+        h("div", { class: "field" }, h("label", {}, "Refuse at score"), rej),
+        h("div", { class: "field" }, h("label", {}, "Greeting pause (ms) for spambots"), pause))),
     h("div", { class: "card" }, h("h3", {}, "DNS blocklists"),
-      h("table", {}, f.dnsbl.map((d) => h("tr", {}, h("td", {}, h("code", {}, d.zone)), h("td", {}, "+" + d.score))))),
-    h("p", { class: "muted" }, "These settings live in postwright.toml; restart the server after changing them."));
+      h("p", { class: "muted small" }, "Each listing adds its score. Spamhaus refuses lookups through big public DNS resolvers, so use your own resolver (such as OPNsense's Unbound)."),
+      h("table", {}, bl),
+      h("div", { class: "row" }, h("button", { class: "ghost", onclick: () => { st.dnsbl.push({ zone: "", score: 4 }); drawBl(); } }, "Add blocklist"))),
+    h("div", { class: "row" }, save));
 }
+
+// ------------------------------------------------------------------- alerts
+async function refreshAlerts() {
+  try {
+    const r = await api("GET", "alerts");
+    document.getElementById("alerts").replaceChildren(...r.alerts.map((a) => h("div", { class: "alert " + a.level }, "⚠ " + a.text, location.hash !== "#filters" ? h("a", { href: "#filters" }, "Open Spam & antivirus →") : null)));
+  } catch (_) {}
+}
+refreshAlerts();
+setInterval(refreshAlerts, 60000);
+window.addEventListener("hashchange", refreshAlerts);
 
 // --------------------------------------------------------------- certificate
 async function certificate() {

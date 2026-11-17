@@ -20,6 +20,14 @@
   a { color:var(--accent); }
   .hidden { display:none !important; }
 
+  /* administrator notices (like MailTips) */
+  .tip { display:flex; gap:12px; align-items:center; padding:8px 16px; font-weight:600; font-size:13px; border-bottom:1px solid var(--line); }
+  .tip.warn { background:#fdf0d5; color:#7a4a00; }
+  .tip.err { background:#fbe0dd; color:#8c1d16; }
+  .tip a { margin-left:auto; color:inherit; white-space:nowrap; }
+  .tip button { border:0; background:transparent; color:inherit; font-size:16px; padding:0 4px; }
+  @media (prefers-color-scheme: dark) { .tip.warn { background:#3a2c10; color:#f3c27a; } .tip.err { background:#3d1a17; color:#f4a59d; } }
+
   /* top bar */
   #top { display:flex; align-items:center; gap:14px; padding:8px 14px; background:var(--card); border-bottom:1px solid var(--line); min-height:52px; }
   #brand { font-weight:700; font-size:16px; letter-spacing:.2px; margin-right:6px; white-space:nowrap; }
@@ -249,6 +257,7 @@
     </div>
   </div>
 </div>
+<div id="banner"></div>
 <main>
   <!-- Mail -->
   <div class="view" id="v-mail">

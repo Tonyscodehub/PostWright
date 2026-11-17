@@ -489,14 +489,53 @@ pub(crate) async fn route(srv: &Shared, me: &User, r: &Req, rest: &str) -> Resul
             Ok(j!({ "lines": logbuf::recent(n, q.as_deref()) }))
         }
         ("GET", ["filters"]) => {
-            let f = &srv.cfg.filter;
+            let f = srv.filter();
+            let held = srv.store.call(|c| crate::hold::list(c)).await?;
             Ok(j!({
                 "enabled": f.enabled, "junk_score": f.junk_score, "reject_score": f.reject_score,
                 "greet_pause_ms": f.greet_pause_ms, "scan_outbound": f.scan_outbound,
                 "dnsbl": f.dnsbl.iter().map(|d| j!({"zone": d.zone, "score": d.score})).collect::<Vec<_>>(),
                 "scanners": crate::filter::health(srv).await,
+                "settings": serde_json::to_value(&*f)?,
+                "detected": crate::filter::detect_local().await,
+                "held": held,
+                "saved_in": crate::configloc::ACTIVE.get().map(|l| l.describe()),
             }))
         }
+        ("PUT", ["filters"]) => {
+            let new: crate::filter::FilterConfig = body(r)?;
+            crate::filter::validate(&new)?;
+            let loc = crate::configloc::ACTIVE.get().ok_or_else(|| anyhow::anyhow!("settings location unknown"))?;
+            let value = toml::Value::try_from(&new)?;
+            crate::setup::edit_config(loc, |t| {
+                t.insert("filter".into(), value);
+            })?;
+            srv.set_filter(new);
+            crate::hold::WAKE.notify_one();
+            tracing::info!("admin {} changed the spam and antivirus settings", me.email);
+            Ok(j!({ "ok": true, "scanners": crate::filter::health(srv).await }))
+        }
+        ("POST", ["filters", "test"]) => {
+            // Tests the settings as entered (saved or not).
+            let v: Value = if r.body.is_empty() { j!({}) } else { body(r)? };
+            let f: crate::filter::FilterConfig = if v.as_object().map(|o| o.is_empty()).unwrap_or(true) { (*srv.filter()).clone() } else { serde_json::from_value(v)? };
+            Ok(j!({ "results": crate::filter::self_test(&f).await }))
+        }
+        ("POST", ["held", "retry"]) => {
+            let n = crate::hold::retry_all(srv).await?;
+            Ok(j!({ "ok": true, "delivered": n }))
+        }
+        ("POST", ["held", id, "release"]) => {
+            crate::hold::release(srv, id.parse()?).await?;
+            tracing::warn!("admin {} released held message {id} without scanning", me.email);
+            Ok(j!({ "ok": true }))
+        }
+        ("DELETE", ["held", id]) => {
+            crate::hold::delete(srv, id.parse()?).await?;
+            tracing::info!("admin {} deleted held message {id}", me.email);
+            Ok(j!({ "ok": true }))
+        }
+        ("GET", ["alerts"]) => Ok(j!({ "alerts": crate::hold::alerts(srv).await })),
         ("GET", ["import"]) => {
             let st = IMPORT.lock().unwrap().clone();
             let out = iredmail::OUTPUT.lock().unwrap().clone();
@@ -581,7 +620,7 @@ async fn overview(srv: &Shared) -> Result<Value> {
         "server_dns": { "addresses": ips, "ptr": ptrs, "ptr_matches": ptr_ok },
         "scanners": crate::filter::health(srv).await,
         "certificate": crate::certs::current(&srv.cfg).ok(),
-        "filter_enabled": srv.cfg.filter.enabled,
+        "filter_enabled": srv.filter().enabled,
         "recent_warnings": warnings,
         "listeners": {
             "smtp": srv.cfg.listeners.smtp, "submission": srv.cfg.listeners.submission,

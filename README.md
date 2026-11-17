@@ -206,7 +206,16 @@ Filtering happens inside the SMTP conversation, so spam and malware are refused 
 
 Senders' own `X-Spam-*` and forged `Authentication-Results` headers are stripped.
 
-**Plugins**: add a section to enable each one.
+**Scanners:** ClamAV (antivirus), Rspamd, and SpamAssassin (spam scoring). Turn each one on, set its address, and choose what happens if it stops responding, all on the admin console's **Spam & antivirus** page (browser or desktop app). Changes take effect as soon as you save, with no restart. Scanners already running on the server are found automatically, and **Test scanners** sends each one the standard harmless test virus (EICAR) or test spam (GTUBE) to prove it's catching things.
+
+**If a scanner stops responding**, choose one of:
+- **Hold the mail here** (recommended for ClamAV): the message is accepted, kept on Postwright, and scanned and delivered automatically once the scanner is back. While anything is held, administrators see a coloured banner at the top of the webmail and the admin console. The **Spam & antivirus** page lists held mail with **Release** (deliver without scanning) and **Delete**. If held outgoing mail turns out to be infected, the sender is told it wasn't sent.
+- **Ask the sender to try again later**: sending servers retry for days, so nothing is lost, but mail is delayed and nothing shows here.
+- **Deliver without this scanner**: mail keeps flowing unscanned.
+
+**ClamAV on Windows:** install the official ClamAV Windows package, copy `clamd.conf.sample` and `freshclam.conf.sample` from its `conf_examples` folder into the ClamAV folder as `clamd.conf` and `freshclam.conf`, and put `#` in front of the `Example` line in both. In `clamd.conf`, set `TCPSocket 3310` and `TCPAddr 127.0.0.1`. Then, as administrator, run `freshclam.exe` once and install both services (`clamd.exe --install-service`, `freshclam.exe --install-service`; older builds use `--install`), set them to start automatically, and turn ClamAV on in the admin console at `127.0.0.1:3310`. Rspamd and SpamAssassin run on Linux only, for example in a small VM or container.
+
+The same settings can be edited by hand under `[filter]` in the settings (the registry on Windows):
 
 ```toml
 [filter]
@@ -214,8 +223,8 @@ junk_score = 5.0      # delivered to the Junk folder at or above this
 reject_score = 12.0   # refused at or above this
 
 [filter.clamav]
-address = "unix:/run/clamav/clamd.ctl"    # or "127.0.0.1:3310"
-on_fail = "tempfail"                     # scanner down: defer mail rather than let it through
+address = "127.0.0.1:3310"               # or "unix:/run/clamav/clamd.ctl"
+on_fail = "hold"                         # or "tempfail" or "accept"
 
 [filter.rspamd]
 url = "http://127.0.0.1:11333"
@@ -476,6 +485,8 @@ Sign in with `POST /api/v1/login` (`kind: "web"` sets a session cookie; `"app"` 
 ## Administration
 
 ### Admin console and desktop app
+
+**← Back to mail** at the top of the console's menu returns to your mailbox. **My settings** at the bottom opens your own settings page.
 
 Give an account admin rights first:
 

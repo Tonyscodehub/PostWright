@@ -23,6 +23,8 @@ pub struct Server {
     pub changes: broadcast::Sender<i64>,
     /// Wakes the outbound queue when new mail is queued.
     pub queue_wake: Notify,
+    /// Spam and antivirus settings, changeable from the admin console while running.
+    filter: RwLock<Arc<crate::filter::FilterConfig>>,
 }
 
 pub type Shared = Arc<Server>;
@@ -36,7 +38,17 @@ impl Server {
             .or_else(|_| MessageAuthenticator::new_cloudflare())
             .map_err(|e| anyhow::anyhow!("DNS resolver: {e}"))?;
         let (changes, _) = broadcast::channel(1024);
-        Ok(Arc::new(Self { cfg, store, tls: RwLock::new(tls), guard, dns, changes, queue_wake: Notify::new() }))
+        let filter = RwLock::new(Arc::new(cfg.filter.clone()));
+        Ok(Arc::new(Self { cfg, store, tls: RwLock::new(tls), guard, dns, changes, queue_wake: Notify::new(), filter }))
+    }
+
+    /// The spam and antivirus settings in force now.
+    pub fn filter(&self) -> Arc<crate::filter::FilterConfig> {
+        self.filter.read().unwrap().clone()
+    }
+
+    pub fn set_filter(&self, f: crate::filter::FilterConfig) {
+        *self.filter.write().unwrap() = Arc::new(f);
     }
 
     pub fn tls(&self) -> TlsAcceptor {

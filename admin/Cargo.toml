@@ -1,6 +1,6 @@
 [package]
 name = "postwright-admin"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Desktop administration app for the Postwright mail server"
 license = "MIT"

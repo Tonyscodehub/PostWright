@@ -22,6 +22,7 @@ start postwright.toml; echo "core:";     timeout 150 python3 -I $T/e2e.py | grep
 start postwright.toml; echo "dkim:";     python3 -I $T/dkim_check.py
 start postwright.toml; echo "features:"; timeout 150 python3 -I $T/e2e_features.py | grep -E "FAIL|passed"
 start postwright.toml; echo "webmail:";  timeout 300 python3 -I $T/webmail_check.py | grep -E "FAIL|passed"
+start postwright.toml; echo "hold:";     timeout 300 python3 -I $T/hold_check.py | grep -E "FAIL|passed"
 start postwright.toml; echo "admin:";    timeout 150 python3 -I $T/admin_check.py | grep -E "FAIL|passed"
 # Scanner suite: real ClamAV, Rspamd and SpamAssassin must be running.
 start filter.toml;     echo "filters:";  timeout 150 python3 -I $T/filter_check.py | grep -E "FAIL|passed"

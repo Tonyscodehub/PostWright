@@ -22,6 +22,10 @@ pub const ETC_FILE: &str = "/etc/postwright/postwright.toml";
 #[cfg(unix)]
 pub const VAR_DIR: &str = "/var/lib/postwright";
 
+/// Where the running server's settings came from (for saving changes made in the
+/// admin console).
+pub static ACTIVE: std::sync::OnceLock<Loc> = std::sync::OnceLock::new();
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Loc {
     File(PathBuf),

@@ -714,7 +714,8 @@ async fn submit(srv: &Shared, user: &User, mut c: Compose, draft: bool) -> Resul
     }
 
     // Same checks and treatment as mail sent from an email app.
-    let fcfg = srv.cfg.filter.clone();
+    let fcfg = srv.filter();
+    let mut held: Option<crate::filter::Verdict> = None;
     if fcfg.enabled && fcfg.scan_outbound {
         let mut v = crate::filter::Verdict::default();
         let env = crate::filter::Envelope { ip: std::net::IpAddr::from([127, 0, 0, 1]), helo: "webmail", mail_from: &from_addr, rcpts: &rcpts, user: Some(&user.email) };
@@ -725,8 +726,11 @@ async fn submit(srv: &Shared, user: &User, mut c: Compose, draft: bool) -> Resul
         if v.force_reject {
             bail!("not sent: the spam filter rejected this message");
         }
-        if let Some(t) = v.tempfail {
+        if let Some(t) = &v.tempfail {
             bail!("not sent: {t}. Try again in a minute");
+        }
+        if v.hold.is_some() {
+            held = Some(v);
         }
     }
     let settings = srv.store.call(move |cn| crate::prefs::load(cn, uid)).await?;
@@ -744,8 +748,14 @@ async fn submit(srv: &Shared, user: &User, mut c: Compose, draft: bool) -> Resul
     if let Some(d) = dom {
         full = crate::delivery::dkim_sign(&d, full)?;
     }
-    let failed = crate::delivery::deliver(srv, &from_addr, &rcpts, full).await?;
-    if failed.len() == rcpts.len() {
+    let failed = if let Some(v) = &held {
+        let h = crate::hold::NewHeld { direction: "out", mail_from: &from_addr, rcpts: &rcpts, ip: "127.0.0.1".into(), helo: "webmail", user: Some(&user.email), verdict: v };
+        crate::hold::hold(srv, h, full).await?;
+        vec![]
+    } else {
+        crate::delivery::deliver(srv, &from_addr, &rcpts, full).await?
+    };
+    if failed.len() == rcpts.len() && held.is_none() {
         bail!("couldn't send to any of the recipients");
     }
     tracing::info!("webmail: {} sent a message to {} recipient(s)", user.email, rcpts.len());
@@ -778,7 +788,7 @@ async fn submit(srv: &Shared, user: &User, mut c: Compose, draft: bool) -> Resul
         })
         .await?;
     srv.notify_user(uid);
-    Ok(j!({ "ok": true, "failed": failed }))
+    Ok(j!({ "ok": true, "failed": failed, "held": held.is_some() }))
 }
 
 // ------------------------------------------------------------ contacts lookup

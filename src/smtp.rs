@@ -60,7 +60,7 @@ pub async fn handle(srv: Shared, stream: Stream, peer: SocketAddr, mode: Mode) -
         s.conn.send("421 4.7.0 Too many failed logins, try later").await?;
         return Ok(());
     }
-    let f = &s.srv.cfg.filter;
+    let f = s.srv.filter();
     if mode == Mode::Inbound && f.enabled {
         // Pause before the banner (spambots talk first) while the DNSBL lookups run.
         let srv = s.srv.clone();
@@ -458,7 +458,7 @@ impl Session {
         // Remove any Authentication-Results forged with our own authserv-id.
         let body = strip_forged_auth_results(&body, &host);
         let mut prefix = String::new();
-        let fcfg = self.srv.cfg.filter.clone();
+        let fcfg = self.srv.filter();
         let mut verdict = self.pre.clone();
         if self.srv.cfg.inbound.verify {
             let Some(msg) = AuthenticatedMessage::parse(&body) else {
@@ -535,6 +535,17 @@ impl Session {
             let rcpts = self.rcpts.clone();
             let env = crate::filter::Envelope { ip, helo: &helo, mail_from: &mail_from, rcpts: &rcpts, user: None };
             crate::filter::scan_content(&self.srv, &env, &body, &mut verdict).await;
+            if verdict.hold.is_some() && verdict.virus.is_none() {
+                // A scanner is down and set to hold: accept now, scan and deliver later.
+                let with = if self.conn.stream.is_tls() { "ESMTPS" } else { "ESMTP" };
+                let rcpt = if self.rcpts.len() == 1 { Some(self.rcpts[0].clone()) } else { None };
+                let mut data = self.received_header(with, rcpt.as_deref()).into_bytes();
+                data.extend_from_slice(prefix.as_bytes());
+                data.extend_from_slice(&body);
+                let h = crate::hold::NewHeld { direction: "in", mail_from: &mail_from, rcpts: &rcpts, ip: ip.to_string(), helo: &helo, user: None, verdict: &verdict };
+                crate::hold::hold(&self.srv, h, data).await?;
+                return Ok("250 2.0.0 OK: accepted, held for scanning".into());
+            }
             match verdict.action(&fcfg) {
                 crate::filter::Action::Reject(r) | crate::filter::Action::Tempfail(r) => {
                     tracing::info!("refused message from {ip} <{mail_from}>: {} [{}]", r, verdict.reasons.join(" "));
@@ -607,7 +618,8 @@ impl Session {
                 delivery::domain_of(&mail_from)
             ));
         }
-        let fcfg = self.srv.cfg.filter.clone();
+        let fcfg = self.srv.filter();
+        let mut held: Option<crate::filter::Verdict> = None;
         if fcfg.enabled && fcfg.scan_outbound {
             let mut v = crate::filter::Verdict::default();
             let rcpts = self.rcpts.clone();
@@ -624,8 +636,11 @@ impl Session {
                 tracing::warn!("blocked outbound spam from {} [{}]", user.email, v.reasons.join(" "));
                 return Ok("550 5.7.1 Message rejected as spam".into());
             }
-            if let Some(t) = v.tempfail {
+            if let Some(t) = &v.tempfail {
                 return Ok(format!("451 4.7.1 {t}, try again later"));
+            }
+            if v.hold.is_some() {
+                held = Some(v);
             }
         }
         let uid = user.id;
@@ -645,6 +660,13 @@ impl Session {
             .await?;
         if let Some(d) = dom {
             data = delivery::dkim_sign(&d, data)?;
+        }
+        if let Some(v) = &held {
+            let rcpts = self.rcpts.clone();
+            let helo = self.helo.clone().unwrap_or_default();
+            let h = crate::hold::NewHeld { direction: "out", mail_from: &mail_from, rcpts: &rcpts, ip: self.peer.ip().to_string(), helo: &helo, user: Some(&user.email), verdict: v };
+            crate::hold::hold(&self.srv, h, data).await?;
+            return Ok("250 2.0.0 OK: held for scanning, it will be sent once the scanner is back".into());
         }
         let failed = delivery::deliver(&self.srv, &mail_from, &self.rcpts.clone(), data).await?;
         tracing::info!("submission from {} to {} recipient(s)", user.email, self.rcpts.len());

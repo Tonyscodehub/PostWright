@@ -643,7 +643,7 @@ const compose = {
     try {
       const r = await call("POST", "mail/send", p);
       this.close(true);
-      toast(r.failed && r.failed.length ? `Sent, but not to ${r.failed.join(", ")}` : "Sent");
+      toast(r.held ? "Held for scanning: it will go out automatically once the scanner is back" : r.failed && r.failed.length ? `Sent, but not to ${r.failed.join(", ")}` : "Sent");
       if (["sent", "drafts"].includes(mail.special(mail.folder))) mail.loadList();
       mail.loadFolders().catch(() => {});
     } catch (e) { $("c-status").textContent = ""; fail(e); }
@@ -1087,13 +1087,28 @@ const contacts = {
 };
 $("new-ct").onclick = () => contacts.edit(null);
 
+// ===================================================== administrator notices
+
+const dismissed = new Set();
+function renderAlerts(list) {
+  const box = $("banner");
+  box.replaceChildren(...(list || []).filter((a) => !dismissed.has(a.text)).map((a) =>
+    h("div", { class: "tip " + a.level, role: "status" }, "⚠ " + a.text,
+      h("a", { href: a.link || "/admin" }, "Open in Administration →"),
+      h("button", { title: "Hide for now", onclick: () => { dismissed.add(a.text); renderAlerts(list); } }, "×"))));
+}
+
 // ========================================================================= start
 
 async function start() {
   try { me = await call("GET", "me"); } catch (_) { return; }
   $("me-btn").replaceChildren(h("span", { class: "full" }, me.name || me.email), h("span", { class: "init" }, initials(me.name || me.email.split("@")[0])));
   $("me-btn").title = me.email;
-  if (me.is_admin) $("admin-link").classList.remove("hidden");
+  if (me.is_admin) {
+    $("admin-link").classList.remove("hidden");
+    renderAlerts(me.alerts);
+    setInterval(async () => { try { const m = await call("GET", "me"); renderAlerts(m.alerts); } catch (_) {} }, 60000);
+  }
   const [app, arg] = location.hash.slice(1).split("/");
   if (app === "mail" && arg) mail.folder = decodeURIComponent(arg);
   await mail.loadFolders().catch(fail);

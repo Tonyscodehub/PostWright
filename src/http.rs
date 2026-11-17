@@ -470,6 +470,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
         ("GET", ["me"]) => {
             let (used, name) = srv.store.call(move |c| Ok((store::user_usage(c, uid)?, store::display_name(c, uid)?))).await?;
             let host = srv.cfg.hostname.clone();
+            let alerts = if user.is_admin { crate::hold::alerts(srv).await } else { vec![] };
             Ok(json(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -479,6 +480,7 @@ async fn api_inner(srv: &Shared, user: User, r: &Req, rest: &str) -> Result<Resp
                     "caldav": format!("https://{host}{}/dav/", https_port_suffix(srv)),
                     "carddav": format!("https://{host}{}/dav/", https_port_suffix(srv)),
                     "name": name,
+                    "alerts": alerts,
                 }),
             ))
         }

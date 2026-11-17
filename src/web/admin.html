@@ -18,6 +18,18 @@
   nav .host { color:var(--muted); font-size:12px; margin:0 20px 18px; word-break:break-all; }
   nav a { display:block; padding:8px 20px; color:var(--ink); text-decoration:none; border-left:3px solid transparent; }
   nav a:hover { background:var(--accent-soft); }
+  nav a.back { color:var(--accent); font-weight:600; margin-bottom:10px; border-bottom:1px solid var(--line); padding-bottom:12px; }
+  .alert { display:flex; gap:12px; align-items:center; padding:10px 32px; font-weight:600; border-bottom:1px solid var(--line); }
+  .alert.warn { background:var(--warn-soft); color:var(--warn); }
+  .alert.err { background:var(--err-soft); color:var(--err); }
+  .alert a { margin-left:auto; color:inherit; white-space:nowrap; }
+  .scanner { border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
+  .scanner h4 { margin:0; font-size:14px; display:flex; gap:8px; align-items:center; }
+  .scanner .form { margin:10px 0 0; }
+  .radios { display:grid; gap:6px; margin-top:4px; }
+  .field .radios label { display:flex; gap:8px; align-items:flex-start; font-weight:400; margin:0; }
+  .field .radios input { margin-top:3px; }
+  .radios label span { color:var(--muted); font-size:13px; }
   nav a.active { border-left-color:var(--accent); background:var(--accent-soft); font-weight:600; }
   nav .foot { position:absolute; bottom:16px; left:20px; right:20px; font-size:12px; color:var(--muted); }
   nav .foot a { padding:0; border:0; display:inline; color:var(--accent); }
@@ -82,6 +94,7 @@
 <nav>
   <h1>Postwright</h1>
   <div class="host" id="host"></div>
+  <a href="/" class="back">← Back to mail</a>
   <a href="#overview">Overview</a>
   <a href="#domains">Domains</a>
   <a href="#users">Users</a>
@@ -93,9 +106,9 @@
   <a href="#certificate">Certificate</a>
   <a href="#import">Import from iRedMail</a>
   <a href="#logs">Logs</a>
-  <div class="foot"><a href="/">My settings</a> · <a href="#" id="signout">Sign out</a> · <span id="ver"></span></div>
+  <div class="foot"><a href="/settings">My settings</a> · <a href="#" id="signout">Sign out</a> · <span id="ver"></span></div>
 </nav>
-<main id="main"></main>
+<div id="content"><div id="alerts"></div><main id="main"></main></div>
 <script src="/migrate.js"></script>
 <script src="/admin.js"></script>
 </body>

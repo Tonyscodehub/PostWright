@@ -46,6 +46,8 @@ enum Msg {
     Loaded(Page, Result<Value, String>),
     Done(Page, String, Result<Value, String>),
     Dns(String, Result<Value, String>),
+    Alerts(Result<Value, String>),
+    Tested(Result<Value, String>),
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -215,6 +217,12 @@ struct App {
     log_filter: String,
     log_live: bool,
     last_poll: Instant,
+    /// Administrator notices (held mail, scanners down), refreshed every minute.
+    alerts: Vec<Value>,
+    last_alerts: Option<Instant>,
+    /// Spam & antivirus settings being edited, and the last scanner test.
+    filter_edit: Option<Value>,
+    filter_test: Option<Value>,
 }
 
 impl App {
@@ -283,6 +291,10 @@ impl App {
             log_filter: String::new(),
             log_live: true,
             last_poll: Instant::now(),
+            alerts: Vec::new(),
+            last_alerts: None,
+            filter_edit: None,
+            filter_test: None,
         }
     }
 
@@ -366,6 +378,19 @@ impl App {
 
     fn handle(&mut self, ctx: &egui::Context, m: Msg) {
         match m {
+            Msg::Alerts(r) => {
+                self.busy = self.busy.saturating_sub(1);
+                if let Ok(v) = r {
+                    self.alerts = v["alerts"].as_array().cloned().unwrap_or_default();
+                }
+            }
+            Msg::Tested(r) => {
+                self.busy = self.busy.saturating_sub(1);
+                match r {
+                    Ok(v) => self.filter_test = Some(v),
+                    Err(e) => self.error(e),
+                }
+            }
             Msg::LoggedIn(c, v, pin) => {
                 self.login_busy = false;
                 if let Pin::Drop = pin {
@@ -418,7 +443,10 @@ impl App {
                             Page::Migration => self.migration = Some(v.clone()),
                             Page::Aliases => self.aliases = arr(),
                             Page::Queue => self.queue = arr(),
-                            Page::Filters => self.filters = Some(v.clone()),
+                            Page::Filters => {
+                                self.filter_edit = Some(v["settings"].clone());
+                                self.filters = Some(v.clone());
+                            }
                             Page::Certificate => self.certs = Some(v.clone()),
                             Page::Import => self.import = Some(v.clone()),
                             Page::Logs => {
@@ -1243,33 +1271,194 @@ impl App {
     }
 
     fn filters_view(&mut self, ui: &mut egui::Ui) {
-        let Some(f) = self.filters.clone() else {
+        let ctx = ui.ctx().clone();
+        let (Some(f), Some(mut st)) = (self.filters.clone(), self.filter_edit.clone()) else {
             self.header(ui, "Spam & antivirus", "");
             return;
         };
-        let on = f["enabled"].as_bool().unwrap_or(false);
-        self.header(ui, "Spam & antivirus", if on { "Filtering is on." } else { "Filtering is off (filter.enabled = false)." });
-        stats(
-            ui,
-            &[
-                (f["junk_score"].to_string(), "Junk folder at score"),
-                (f["reject_score"].to_string(), "Reject at score"),
-                (format!("{} ms", f["greet_pause_ms"]), "Greeting pause"),
-                ((if f["scan_outbound"].as_bool().unwrap_or(false) { "Yes" } else { "No" }).to_string(), "Scan outgoing mail"),
-            ],
-        );
-        ui.add_space(12.0);
-        scanners_card(ui, &f["scanners"]);
-        card(ui, "DNS blocklists", |ui| {
-            egui::Grid::new("dnsbl").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
-                for d in f["dnsbl"].as_array().cloned().unwrap_or_default() {
-                    ui.label(RichText::new(s(&d["zone"])).monospace());
-                    ui.label(format!("+{}", d["score"]));
+        self.header(ui, "Spam & antivirus", &format!("Changes take effect as soon as you save. They're kept in {}.", s(&f["saved_in"])));
+
+        // Held mail
+        let held = f["held"].as_array().cloned().unwrap_or_default();
+        if !held.is_empty() {
+            card(ui, &format!("Held for scanning ({})", held.len()), |ui| {
+                ui.label("Delivered automatically once scanning works again. Releasing sends a message on without scanning it.");
+                if ui.button("Try scanning now").clicked() {
+                    self.action(&ctx, "POST", "held/retry".into(), json!({}), Page::Filters, "Checked again");
+                }
+                egui::Grid::new("held").num_columns(5).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
+                    for m in &held {
+                        ui.label(when(m["received"].as_i64().unwrap_or(0)));
+                        ui.label(format!("{} {}", if m["direction"] == "out" { "Out:" } else { "In:" }, s(&m["from"])));
+                        ui.label(list(&m["to"]).join(", "));
+                        ui.label(s(&m["subject"]));
+                        ui.horizontal(|ui| {
+                            let id = m["id"].as_i64().unwrap_or(0);
+                            if ui.button("Release").on_hover_text("Deliver without scanning").clicked() {
+                                self.action(&ctx, "POST", format!("held/{id}/release"), json!({}), Page::Filters, "Released");
+                            }
+                            if ui.button("Delete").clicked() {
+                                self.action(&ctx, "DELETE", format!("held/{id}"), Value::Null, Page::Filters, "Deleted");
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+
+        // Scanners
+        let health = f["scanners"].as_array().cloned().unwrap_or_default();
+        let detected = f["detected"].as_array().cloned().unwrap_or_default();
+        let mut changed = false;
+        card(ui, "Scanners", |ui| {
+            let defs = [
+                ("clamav", "ClamAV antivirus", "ClamAV", "address", "127.0.0.1:3310", "hold", "Checks every message for viruses and malware. Runs on Windows or Linux."),
+                ("rspamd", "Rspamd spam filter", "Rspamd", "url", "http://127.0.0.1:11333", "accept", "Scores mail for spam and learns from Junk. Linux only."),
+                ("spamassassin", "SpamAssassin", "SpamAssassin", "address", "127.0.0.1:783", "accept", "Scores mail for spam (spamd). Linux only."),
+            ];
+            for (key, title, hname, addr_key, def_addr, def_fail, what) in defs {
+                ui.add_space(4.0);
+                let mut on = !st[key].is_null();
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, RichText::new(title).strong()).changed() {
+                        changed = true;
+                        st[key] = if on {
+                            let found = detected.iter().find(|d| d["name"] == key && d["found"] == true).map(|d| s(&d["address"]));
+                            let mut o = json!({ "on_fail": def_fail });
+                            o[addr_key] = json!(found.unwrap_or_else(|| def_addr.to_string()));
+                            if key == "rspamd" {
+                                o["learn"] = json!(true);
+                            }
+                            o
+                        } else {
+                            Value::Null
+                        };
+                    }
+                    if on {
+                        if let Some(h) = health.iter().find(|h| h["name"] == hname) {
+                            if h["ok"].as_bool().unwrap_or(false) {
+                                pill(ui, "Responding", Tone::Good);
+                            } else {
+                                pill(ui, "Not responding", Tone::Bad);
+                            }
+                        }
+                    } else if detected.iter().any(|d| d["name"] == key && d["found"] == true) {
+                        pill(ui, "Found on this server", Tone::Warn);
+                    }
+                });
+                ui.label(RichText::new(what).small().color(ui.visuals().weak_text_color()));
+                if on {
+                    ui.horizontal(|ui| {
+                        ui.label("Address");
+                        let mut a = s(&st[key][addr_key]);
+                        if ui.add(egui::TextEdit::singleline(&mut a).desired_width(240.0)).changed() {
+                            st[key][addr_key] = json!(a);
+                            changed = true;
+                        }
+                    });
+                    let mut fail = s(&st[key]["on_fail"]);
+                    ui.horizontal(|ui| {
+                        ui.label("If it stops responding");
+                        egui::ComboBox::from_id_salt(format!("onfail-{key}"))
+                            .selected_text(match fail.as_str() {
+                                "hold" => "Hold the mail here",
+                                "tempfail" => "Ask senders to try again later",
+                                _ => "Deliver without this scanner",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (v, l) in [("hold", "Hold the mail here (and show a banner)"), ("tempfail", "Ask senders to try again later"), ("accept", "Deliver without this scanner")] {
+                                    if ui.selectable_value(&mut fail, v.to_string(), l).changed() {
+                                        changed = true;
+                                    }
+                                }
+                            });
+                    });
+                    st[key]["on_fail"] = json!(fail);
+                }
+                ui.separator();
+            }
+            if ui.button("Test scanners").on_hover_text("Sends each scanner the standard harmless test virus or test spam").clicked() {
+                let body = st.clone();
+                self.filter_test = None;
+                self.spawn(&ctx, move |c| Msg::Tested(c.send("POST", "filters/test", &body)));
+            }
+            if let Some(t) = &self.filter_test {
+                for r in t["results"].as_array().cloned().unwrap_or_default() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(s(&r["name"])).strong());
+                        if r["ok"].as_bool().unwrap_or(false) {
+                            pill(ui, "Working", Tone::Good);
+                        } else {
+                            pill(ui, "Problem", Tone::Bad);
+                        }
+                        ui.label(s(&r["detail"]));
+                    });
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        card(ui, "Built-in checks", |ui| {
+            for (k, l) in [("enabled", "Filter mail (built-in checks and the scanners above)"), ("scan_outbound", "Also scan mail your users send"), ("add_headers", "Add X-Spam headers to delivered mail")] {
+                let mut v = st[k].as_bool().unwrap_or(false);
+                if ui.checkbox(&mut v, l).changed() {
+                    st[k] = json!(v);
+                    changed = true;
+                }
+            }
+            egui::Grid::new("scores").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+                for (k, l, step) in [("junk_score", "File in Junk at score", 0.5), ("reject_score", "Refuse at score", 0.5), ("greet_pause_ms", "Greeting pause (ms)", 100.0)] {
+                    ui.label(l);
+                    let mut v = st[k].as_f64().unwrap_or(0.0);
+                    if ui.add(egui::DragValue::new(&mut v).speed(step).range(0.0..=30000.0)).changed() {
+                        st[k] = if k == "greet_pause_ms" { json!(v as u64) } else { json!(v) };
+                        changed = true;
+                    }
                     ui.end_row();
                 }
             });
         });
-        ui.label(RichText::new("These settings live in postwright.toml; restart the server after changing them.").small());
+        ui.add_space(8.0);
+        card(ui, "DNS blocklists", |ui| {
+            let mut remove = None;
+            if let Some(list) = st["dnsbl"].as_array_mut() {
+                for (i, d) in list.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let mut z = s(&d["zone"]);
+                        if ui.add(egui::TextEdit::singleline(&mut z).desired_width(240.0)).changed() {
+                            d["zone"] = json!(z);
+                            changed = true;
+                        }
+                        let mut sc = d["score"].as_f64().unwrap_or(0.0);
+                        if ui.add(egui::DragValue::new(&mut sc).speed(0.5).prefix("+")).changed() {
+                            d["score"] = json!(sc);
+                            changed = true;
+                        }
+                        if ui.button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    list.remove(i);
+                    changed = true;
+                }
+                if ui.button("Add blocklist").clicked() {
+                    list.push(json!({ "zone": "", "score": 4.0 }));
+                    changed = true;
+                }
+            }
+        });
+        ui.add_space(8.0);
+        if ui.add(egui::Button::new(RichText::new("Save").strong()).min_size(egui::vec2(90.0, 30.0))).clicked() {
+            self.action(&ctx, "PUT", "filters".into(), st.clone(), Page::Filters, "Saved: in use now, no restart needed");
+            self.last_alerts = None;
+        }
+        if changed || self.filter_edit.as_ref() != Some(&st) {
+            self.filter_edit = Some(st);
+        }
     }
 
     fn cert_view(&mut self, ui: &mut egui::Ui) {
@@ -1518,6 +1707,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(every);
         }
 
+        // Notices for administrators, like the banner in the web console.
+        if self.client.is_some() && self.last_alerts.map(|t| t.elapsed() >= Duration::from_secs(60)).unwrap_or(true) {
+            self.last_alerts = Some(Instant::now());
+            self.spawn(&ctx, |c| Msg::Alerts(c.get("alerts")));
+        }
+        ctx.request_repaint_after(Duration::from_secs(60));
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1554,6 +1750,27 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.add_space(6.0);
+                for a in self.alerts.clone() {
+                    let warn = a["level"] == "warn";
+                    let (fg, bg) = if ui.visuals().dark_mode {
+                        if warn { (Color32::from_rgb(0xf3, 0xc2, 0x7a), Color32::from_rgb(0x3a, 0x2c, 0x10)) } else { (Color32::from_rgb(0xf4, 0xa5, 0x9d), Color32::from_rgb(0x3d, 0x1a, 0x17)) }
+                    } else if warn {
+                        (Color32::from_rgb(0x7a, 0x4a, 0x00), Color32::from_rgb(0xfd, 0xf0, 0xd5))
+                    } else {
+                        (Color32::from_rgb(0x8c, 0x1d, 0x16), Color32::from_rgb(0xfb, 0xe0, 0xdd))
+                    };
+                    egui::Frame::new().fill(bg).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(s(&a["text"])).color(fg).strong());
+                            if self.page != Page::Filters && ui.link(RichText::new("Open Spam & antivirus").color(fg)).clicked() {
+                                self.page = Page::Filters;
+                                self.load(&ctx, Page::Filters);
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
                 match self.page {
                     Page::Overview => self.overview_view(ui),
                     Page::Domains => self.domains_view(ui),

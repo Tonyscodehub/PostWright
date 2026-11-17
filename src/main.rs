@@ -8,6 +8,7 @@ mod config;
 mod configloc;
 mod delivery;
 mod filter;
+mod hold;
 mod http;
 mod identity;
 mod imap;
@@ -988,6 +989,7 @@ fn queue_cmd(cfg: &Config, cmd: QueueCmd) -> Result<()> {
 }
 
 pub fn serve(path: &Loc) -> Result<()> {
+    let _ = configloc::ACTIVE.set(path.clone());
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(|| logbuf::Tee)
@@ -1019,6 +1021,7 @@ pub fn serve(path: &Loc) -> Result<()> {
         server::listen(srv.clone(), "imaps", &l.imaps, true, imap::handle).await?;
         server::listen(srv.clone(), "https", &l.https, true, http::handle).await?;
         tokio::spawn(delivery::run_queue(srv.clone()));
+        tokio::spawn(hold::run(srv.clone()));
 
         // Pick up renewed certificates as soon as the files change (any platform), and
         // accept pushes from OPNsense's ACME client on the built-in SFTP receiver.

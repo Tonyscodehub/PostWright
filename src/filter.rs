@@ -62,6 +62,9 @@ pub enum OnFail {
     Tempfail,
     /// Carry on without this scanner's verdict.
     Accept,
+    /// Accept the message but keep it on this server until the scanner is back, then
+    /// scan and deliver it. Administrators see a banner while anything is held.
+    Hold,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +142,8 @@ pub struct Verdict {
     pub tempfail: Option<String>,
     /// The spam engine asked for greylisting / soft reject (inbound only).
     pub greylist: bool,
+    /// A scanner set to "hold" was unavailable: keep the message until it's back.
+    pub hold: Option<String>,
 }
 
 pub enum Action {
@@ -211,7 +216,8 @@ pub async fn dnsbl(srv: &Shared, ip: IpAddr, v: &mut Verdict) {
         return;
     }
     let rev = reverse_ip(ip);
-    let lookups = srv.cfg.filter.dnsbl.iter().map(|bl| {
+    let fcfg = srv.filter();
+    let lookups = fcfg.dnsbl.iter().map(|bl| {
         let name = format!("{rev}.{}.", bl.zone);
         let srv = srv.clone();
         async move {
@@ -477,7 +483,7 @@ pub async fn spamd_check(cfg: &SpamdConfig, user: Option<&str>, data: &[u8], v: 
 
 /// Teach the spam engines from a user moving mail into (spam) or out of (ham) Junk.
 pub fn learn(srv: &Shared, blobs: Vec<String>, spam: bool, user: String) {
-    let f = &srv.cfg.filter;
+    let f = srv.filter();
     let rs = f.rspamd.clone().filter(|r| r.learn);
     let sa = f.spamassassin.clone().filter(|s| s.learn);
     if !f.enabled || (rs.is_none() && sa.is_none()) || blobs.is_empty() {
@@ -528,7 +534,7 @@ pub fn learn(srv: &Shared, blobs: Vec<String>, spam: bool, user: String) {
 
 /// Run the content scanners (ClamAV, Rspamd, SpamAssassin) and merge into `v`.
 pub async fn scan_content(srv: &Shared, env: &Envelope<'_>, data: &[u8], v: &mut Verdict) {
-    let f = &srv.cfg.filter;
+    let f = srv.filter();
     if let Some(c) = &f.clamav {
         match clamav_scan(c, data).await {
             Ok(Some(virus)) => {
@@ -539,8 +545,10 @@ pub async fn scan_content(srv: &Shared, env: &Envelope<'_>, data: &[u8], v: &mut
             Ok(None) => {}
             Err(e) => {
                 tracing::error!("ClamAV unavailable: {e:#}");
-                if c.on_fail == OnFail::Tempfail {
-                    v.tempfail = Some("Virus scanner unavailable".into());
+                match c.on_fail {
+                    OnFail::Tempfail => v.tempfail = Some("Virus scanner unavailable".into()),
+                    OnFail::Hold => v.hold = Some("ClamAV".into()),
+                    OnFail::Accept => {}
                 }
             }
         }
@@ -548,16 +556,20 @@ pub async fn scan_content(srv: &Shared, env: &Envelope<'_>, data: &[u8], v: &mut
     if let Some(r) = &f.rspamd {
         if let Err(e) = rspamd_check(r, env, data, v).await {
             tracing::error!("Rspamd unavailable: {e:#}");
-            if r.on_fail == OnFail::Tempfail {
-                v.tempfail = Some("Spam filter unavailable".into());
+            match r.on_fail {
+                OnFail::Tempfail => v.tempfail = Some("Spam filter unavailable".into()),
+                OnFail::Hold => v.hold = Some("Rspamd".into()),
+                OnFail::Accept => {}
             }
         }
     }
     if let Some(s) = &f.spamassassin {
         if let Err(e) = spamd_check(s, env.rcpts.first().map(|s| s.as_str()), data, v).await {
             tracing::error!("SpamAssassin unavailable: {e:#}");
-            if s.on_fail == OnFail::Tempfail {
-                v.tempfail = Some("Spam filter unavailable".into());
+            match s.on_fail {
+                OnFail::Tempfail => v.tempfail = Some("Spam filter unavailable".into()),
+                OnFail::Hold => v.hold = Some("SpamAssassin".into()),
+                OnFail::Accept => {}
             }
         }
     }
@@ -614,9 +626,84 @@ async fn ping(addr: &str, req: &[u8], expect: &str) -> Result<()> {
     .map_err(|_| anyhow!("timed out"))?
 }
 
+/// Check settings entered in the admin console before saving them.
+pub fn validate(f: &FilterConfig) -> Result<()> {
+    if !(f.junk_score.is_finite() && f.reject_score.is_finite()) || f.junk_score >= f.reject_score {
+        bail!("the junk score must be lower than the reject score");
+    }
+    if f.greet_pause_ms > 30_000 {
+        bail!("keep the greeting pause under 30 seconds");
+    }
+    let addr_ok = |a: &str| {
+        let a = a.trim();
+        a.starts_with("unix:") && a.len() > 6 || a.rsplit_once(':').map(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()).unwrap_or(false)
+    };
+    if let Some(c) = &f.clamav {
+        if !addr_ok(&c.address) {
+            bail!("ClamAV's address should look like 127.0.0.1:3310");
+        }
+    }
+    if let Some(s) = &f.spamassassin {
+        if !addr_ok(&s.address) {
+            bail!("SpamAssassin's address should look like 127.0.0.1:783");
+        }
+    }
+    if let Some(r) = &f.rspamd {
+        parse_url(&r.url).context("Rspamd's address should look like http://127.0.0.1:11333")?;
+        if let Some(c) = r.controller_url.as_deref().filter(|c| !c.is_empty()) {
+            parse_url(c).context("Rspamd's controller address should look like http://127.0.0.1:11334")?;
+        }
+    }
+    for d in &f.dnsbl {
+        if d.zone.trim().is_empty() || !d.zone.contains('.') || d.zone.contains(char::is_whitespace) || !d.score.is_finite() {
+            bail!("check the blocklist \"{}\"", d.zone);
+        }
+    }
+    Ok(())
+}
+
+const EICAR: &str = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+const GTUBE: &str = "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X";
+
+/// Send each scanner its standard test (EICAR for ClamAV, GTUBE for the spam engines)
+/// and report whether it caught it.
+pub async fn self_test(f: &FilterConfig) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let msg = |body: &str| format!("From: test@postwright.invalid\r\nTo: test@postwright.invalid\r\nSubject: Postwright scanner test\r\n\r\n{body}\r\n").into_bytes();
+    let rcpts = vec!["postmaster@postwright.invalid".to_string()];
+    let env = Envelope { ip: IpAddr::from([127, 0, 0, 1]), helo: "postwright.test", mail_from: "test@postwright.invalid", rcpts: &rcpts, user: None };
+    if let Some(c) = &f.clamav {
+        let r = match clamav_scan(c, &msg(EICAR)).await {
+            Ok(Some(v)) => (true, format!("caught the EICAR test virus ({v})")),
+            Ok(None) => (false, "answered, but didn't detect the EICAR test virus (are its virus definitions downloaded?)".into()),
+            Err(e) => (false, format!("not reachable: {e:#}")),
+        };
+        out.push(serde_json::json!({ "name": "ClamAV", "ok": r.0, "detail": r.1 }));
+    }
+    if let Some(rs) = &f.rspamd {
+        let mut v = Verdict::default();
+        let r = match rspamd_check(rs, &env, &msg(GTUBE), &mut v).await {
+            Ok(()) if v.force_reject || v.score >= f.reject_score => (true, format!("caught the GTUBE test spam (score {:.1})", v.score)),
+            Ok(()) => (false, format!("answered, but scored the GTUBE test only {:.1}", v.score)),
+            Err(e) => (false, format!("not reachable: {e:#}")),
+        };
+        out.push(serde_json::json!({ "name": "Rspamd", "ok": r.0, "detail": r.1 }));
+    }
+    if let Some(sa) = &f.spamassassin {
+        let mut v = Verdict::default();
+        let r = match spamd_check(sa, None, &msg(GTUBE), &mut v).await {
+            Ok(()) if v.score >= 5.0 => (true, format!("caught the GTUBE test spam (score {:.1})", v.score)),
+            Ok(()) => (false, format!("answered, but scored the GTUBE test only {:.1}", v.score)),
+            Err(e) => (false, format!("not reachable: {e:#}")),
+        };
+        out.push(serde_json::json!({ "name": "SpamAssassin", "ok": r.0, "detail": r.1 }));
+    }
+    out
+}
+
 /// Reachability of each configured scanner, for the admin console.
 pub async fn health(srv: &Shared) -> Vec<serde_json::Value> {
-    let f = &srv.cfg.filter;
+    let f = srv.filter();
     let mut out = Vec::new();
     let mut push = |name: &str, addr: &str, r: Result<()>| {
         out.push(serde_json::json!({

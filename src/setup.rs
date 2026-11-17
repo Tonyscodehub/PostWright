@@ -99,7 +99,7 @@ fn self_signed(cfg: &Config, replace: bool) -> Result<bool> {
 }
 
 /// Change top-level or nested keys in the config file, keeping the rest.
-fn edit_config(loc: &Loc, f: impl FnOnce(&mut toml::Table)) -> Result<()> {
+pub(crate) fn edit_config(loc: &Loc, f: impl FnOnce(&mut toml::Table)) -> Result<()> {
     let old = loc.read()?;
     let mut t: toml::Table = old.parse().context("parsing config")?;
     f(&mut t);
