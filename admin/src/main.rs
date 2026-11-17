@@ -56,19 +56,84 @@ struct Saved {
     pins: BTreeMap<String, String>,
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+/// Where earlier versions kept the settings (a JSON file).
+fn legacy_file() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("Postwright Admin").join("config.json"))
 }
 
+fn read_legacy() -> Option<Saved> {
+    let p = legacy_file()?;
+    let s = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
+    // Moved to the standard place: keep the old file only as a record.
+    store_saved(&s);
+    let _ = std::fs::rename(&p, p.with_extension("json.migrated"));
+    Some(s)
+}
+
+// Windows: HKEY_CURRENT_USER\Software\Postwright\Admin (server, email, and a Pins subkey
+// of approved certificate fingerprints).
+#[cfg(windows)]
+mod settings {
+    use super::Saved;
+    use winreg::enums::*;
+    use winreg::RegKey;
+    const KEY: &str = r"Software\Postwright\Admin";
+
+    pub fn load() -> Option<Saved> {
+        let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey(KEY).ok()?;
+        let mut s = Saved { server: k.get_value("Server").unwrap_or_default(), email: k.get_value("Email").unwrap_or_default(), ..Default::default() };
+        if let Ok(p) = k.open_subkey("Pins") {
+            for (name, _) in p.enum_values().flatten() {
+                if let Ok(v) = p.get_value::<String, _>(&name) {
+                    s.pins.insert(name, v);
+                }
+            }
+        }
+        Some(s)
+    }
+
+    pub fn store(s: &Saved) {
+        let Ok((k, _)) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(KEY) else { return };
+        let _ = k.set_value("Server", &s.server);
+        let _ = k.set_value("Email", &s.email);
+        let _ = k.delete_subkey_all("Pins");
+        if let Ok((p, _)) = k.create_subkey("Pins") {
+            for (host, fp) in &s.pins {
+                let _ = p.set_value(host, fp);
+            }
+        }
+    }
+}
+
+// Linux and others: $XDG_CONFIG_HOME/postwright-admin/settings.json (~/.config/...).
+#[cfg(not(windows))]
+mod settings {
+    use super::Saved;
+    fn file() -> Option<std::path::PathBuf> {
+        dirs::config_dir().map(|d| d.join("postwright-admin").join("settings.json"))
+    }
+    pub fn load() -> Option<Saved> {
+        serde_json::from_str(&std::fs::read_to_string(file()?).ok()?).ok()
+    }
+    pub fn store(s: &Saved) {
+        if let Some(p) = file() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(&p, serde_json::to_string_pretty(s).unwrap_or_default());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+}
+
 fn load_saved() -> Saved {
-    config_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    settings::load().or_else(read_legacy).unwrap_or_default()
 }
 
 fn store_saved(s: &Saved) {
-    if let Some(p) = config_path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let _ = std::fs::write(p, serde_json::to_string_pretty(s).unwrap_or_default());
-    }
+    settings::store(s)
 }
 
 #[derive(Default)]

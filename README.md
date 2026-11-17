@@ -75,7 +75,7 @@ ClamAV and Rspamd are Linux services. With Postwright on Windows, run them on a 
 1. Put Postwright on the server: copy `postwright.exe` into a folder of its own on Windows, or `postwright` to `/usr/local/bin` on Linux.
 2. Start it:
    - **Windows:** right-click `postwright.exe` → **Run as administrator**.
-   - **Linux:** `sudo postwright -c /etc/postwright/postwright.toml`
+   - **Linux:** `sudo postwright`
 3. The first time, it opens a **setup page** in your browser (on Linux, open the link it prints). The browser will warn about the certificate: that's expected until a real one is installed, so continue to the page.
 
 The wizard walks through each step in order, checking as it goes:
@@ -90,12 +90,12 @@ The wizard walks through each step in order, checking as it goes:
 8. **Bring mail across** from Microsoft 365, Google, Exchange, IMAP or files (see [Migrations](#migrations)).
 9. **Finish:** installs Postwright as a **service that starts automatically at boot** (a Windows service, or a systemd service on Linux) and restarts itself if it ever stops, then hands over to it and takes you to the sign-in page.
 
-The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. If Postwright is running as a service, the code is in `setup-code.txt` and `postwright.log` next to the settings file. Once an administrator exists and setup is finished, it's gone.
+The setup page is protected by a one-time code printed in Postwright's window (it's already in the link it opens) and only answers on your local network. If Postwright is running as a service, the code is in `setup-code.txt` (and `postwright.log` on Windows) in the data folder: `C:\ProgramData\Postwright` on Windows, `/var/lib/postwright` on Linux. Once an administrator exists and setup is finished, it's gone.
 
 Everything can also be done from the command line, for scripting:
 
 ```sh
-postwright init --hostname mail.example.com      # writes postwright.toml (+ a self-signed cert)
+postwright init --hostname mail.example.com      # writes the settings (+ a self-signed cert)
 postwright domain add example.com                # generates a DKIM key and prints the DNS records
 postwright user add tony@example.com             # prompts for the password
 postwright user admin tony@example.com
@@ -518,7 +518,7 @@ This scales **vertically** on a single host, which is plenty for many thousands 
 ## Deployment
 
 - **Linux:** the release binary is fully static (musl), so it runs on any x86-64 distribution. See `deploy/postwright.service` (systemd, with sandboxing) and `deploy/Dockerfile`.
-- **Windows:** run `postwright.exe` as administrator; the setup wizard's last step installs it as a Windows service (**Postwright mail server** in Services) that starts at boot, before anyone signs in, and restarts itself after a failure. Its log is `postwright.log` next to the settings file. Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
+- **Windows:** run `postwright.exe` as administrator; the setup wizard's last step installs it as a Windows service (**Postwright mail server** in Services) that starts at boot, before anyone signs in, and restarts itself after a failure. Its log is `C:\ProgramData\Postwright\postwright.log`. Allow ports 25, 465, 587, 993, 443, and 2222 (from OPNsense only) in Windows Firewall.
 - **Both:** the service can also be managed from the command line:
 
 ```sh
@@ -528,9 +528,31 @@ postwright service stop | start
 postwright service uninstall
 ```
 
-On Windows, `service install` also adds Windows Firewall rules for ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network (`service uninstall` removes them). **Upgrading on Windows:** unzip the new version into a folder of its own and double-click its `postwright.exe`. It finds the previous version's settings (from the installed service, a neighbouring version folder, or `C:\ProgramData\Postwright`) and carries on with the same mail and data, which aren't moved. If the service is running the older version, it offers to switch the service to the new one.
+On Windows, `service install` also adds Windows Firewall rules for ports 25, 465, 587, 143, 993 and 443, and 2222 from the local network (`service uninstall` removes them). **Upgrading on Windows:** unzip the new version into a folder of its own and double-click its `postwright.exe`. The settings and mail are in the registry and `C:\ProgramData\Postwright`, so it carries on with them. If the service is running the older version, it offers to switch the service to the new one.
 
-The service runs the program from where it was installed, with that settings file, so keep the folder where it is (or run `service install` again after moving it). Double-clicking `postwright.exe` while the service is running just opens the admin console.
+The service runs the program from where it was installed, so keep that folder (or run `service install` again from the new one). Double-clicking `postwright.exe` while the service is running just opens the admin console.
+
+## Where settings and data are kept
+
+| | Settings | Mail, certificates, logs |
+|---|---|---|
+| **Windows** | Registry: `HKEY_LOCAL_MACHINE\SOFTWARE\Postwright` | `C:\ProgramData\Postwright` (`data`, `postwright.log`) |
+| **Linux** (root, or a service) | `/etc/postwright/postwright.toml` | `/var/lib/postwright` (logs go to the journal) |
+| **Linux** (an ordinary user) | `~/.config/postwright/postwright.toml` | `~/.local/share/postwright` |
+| **`-c FILE`** (any platform) | that file | `data` next to it, unless the file says otherwise |
+
+In the registry, each `[section]` of the settings is a subkey: text is `REG_SZ`, lists of text are `REG_MULTI_SZ`, on/off settings and whole numbers are `REG_DWORD`, decimals are `REG_SZ`, and lists of sections (such as `filter\dnsbl`) are numbered subkeys. Anything missing takes its default. Changes made in `regedit` apply when Postwright restarts. A plain copy, `settings-backup.toml`, is written to `C:\ProgramData\Postwright` each time Postwright saves the settings, for reference and recovery only.
+
+```sh
+postwright config where              # where the settings and data are
+postwright config show               # print the settings
+postwright config export backup.toml
+postwright config import backup.toml # checked first; nothing changes if it's not valid
+```
+
+**Coming from an earlier version on Windows** (0.5.6 and before kept `postwright.toml` next to the program): the first time a newer version runs, it finds that file (next to itself, in a neighbouring version folder, or the one the installed service uses), moves the settings into the registry and the mail folder into `C:\ProgramData\Postwright\data`, and renames the old file to `postwright.toml.migrated`. If the service used it, the service is stopped for the move, switched to the new program and started again. It needs **Run as administrator**; without it, Postwright keeps using the old file until it's next run as administrator. On Linux, an existing `postwright.toml` in the current folder keeps working, and the systemd unit already names its file.
+
+The desktop admin app keeps its server, email address and approved certificates in `HKEY_CURRENT_USER\Software\Postwright\Admin` on Windows and `~/.config/postwright-admin/settings.json` on Linux; settings from earlier versions are moved there the first time it runs.
 
 ## Not yet included
 

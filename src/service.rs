@@ -3,6 +3,7 @@
 
 #[allow(unused_imports)]
 use anyhow::{bail, Context, Result};
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -37,14 +38,20 @@ impl State {
     }
 }
 
-fn paths(config: &Path) -> Result<(PathBuf, PathBuf)> {
+use crate::configloc::Loc;
+
+/// The program, and the settings file if the settings are in a file.
+fn paths(config: &Loc) -> Result<(PathBuf, Option<PathBuf>)> {
     let exe = std::env::current_exe()?.canonicalize()?;
-    let cfg = config.canonicalize().with_context(|| format!("{} doesn't exist", config.display()))?;
+    let cfg = match config {
+        Loc::File(p) => Some(p.canonicalize().with_context(|| format!("{} doesn't exist", p.display()))?),
+        Loc::Registry => None,
+    };
     #[cfg(windows)]
     {
         // canonicalize() gives \\?\C:\... which the service manager doesn't need.
         let strip = |p: PathBuf| PathBuf::from(p.display().to_string().trim_start_matches(r"\\?\").to_string());
-        return Ok((strip(exe), strip(cfg)));
+        return Ok((strip(exe), cfg.map(strip)));
     }
     #[allow(unreachable_code)]
     Ok((exe, cfg))
@@ -75,8 +82,12 @@ mod win {
         }
     }
 
-    pub fn install(config: &Path) -> Result<String> {
+    pub fn install(config: &Loc) -> Result<String> {
         let (exe, cfg) = paths(config)?;
+        let mut args = vec![OsString::from("service"), OsString::from("run")];
+        if let Some(c) = &cfg {
+            args.extend([OsString::from("-c"), c.clone().into_os_string()]);
+        }
         let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE).map_err(denied)?;
         let info = ServiceInfo {
             name: OsString::from(NAME),
@@ -85,7 +96,7 @@ mod win {
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: exe.clone(),
-            launch_arguments: vec![OsString::from("service"), OsString::from("run"), OsString::from("-c"), cfg.clone().into_os_string()],
+            launch_arguments: args,
             dependencies: vec![],
             account_name: None, // LocalSystem
             account_password: None,
@@ -115,7 +126,7 @@ mod win {
         let fw = firewall();
         // The scheduled task used by earlier versions isn't needed any more.
         let _ = std::process::Command::new("schtasks").args(["/Delete", "/TN", "Postwright", "/F"]).output();
-        Ok(format!("Windows service \"{NAME}\": starts automatically at boot and restarts if it stops. It runs {} with {}. {fw}", exe.display(), cfg.display()))
+        Ok(format!("Windows service \"{NAME}\": starts automatically at boot and restarts if it stops. It runs {} with the settings in {}. {fw}", exe.display(), config.describe()))
     }
 
     /// Windows Firewall rules for the mail ports (2222 for certificate pushes only from
@@ -223,12 +234,12 @@ mod win {
         installed().and_then(|x| x.1)
     }
 
-    static CONFIG: OnceLock<PathBuf> = OnceLock::new();
+    static CONFIG: OnceLock<Loc> = OnceLock::new();
 
     define_windows_service!(ffi_service_main, service_main);
 
     /// Called when the service manager starts us ("postwright service run").
-    pub fn dispatch(config: PathBuf) -> Result<()> {
+    pub fn dispatch(config: Loc) -> Result<()> {
         let _ = CONFIG.set(config);
         service_dispatcher::start(NAME, ffi_service_main).context("this command is run by Windows' service manager; use \"postwright service start\" instead")?;
         Ok(())
@@ -256,10 +267,10 @@ mod win {
             process_id: None,
         };
         let _ = h.set_service_status(status(ServiceState::Running, 0));
-        let cfg = CONFIG.get().cloned().unwrap_or_else(|| PathBuf::from("postwright.toml"));
-        if let Some(dir) = cfg.parent() {
-            crate::logbuf::log_to_file(&dir.join("postwright.log"));
-        }
+        let cfg = CONFIG.get().cloned().unwrap_or(Loc::Registry);
+        let home = cfg.data_home();
+        let _ = std::fs::create_dir_all(&home);
+        crate::logbuf::log_to_file(&home.join("postwright.log"));
         let r = crate::serve(&cfg);
         if let Err(e) = &r {
             crate::logbuf::write_line(&format!("Postwright stopped: {e:#}"));
@@ -295,13 +306,20 @@ mod nix {
         Ok(())
     }
 
-    pub fn install(config: &Path) -> Result<String> {
+    pub fn install(config: &Loc) -> Result<String> {
         check()?;
         let (exe, cfg) = paths(config)?;
+        let cfg = cfg.ok_or_else(|| anyhow::anyhow!("no settings file"))?;
+        // ProtectSystem=full makes /etc read-only, but the settings are edited from the
+        // admin pages, so their folder (and the data folder) stay writable.
+        let cfg_dir = cfg.parent().map(Path::to_path_buf).unwrap_or_default();
+        let data = config.data_home();
         let unit = format!(
-            "[Unit]\nDescription=Postwright mail server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} -c {} serve\nRestart=always\nRestartSec=5\nLimitNOFILE=65536\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nProtectSystem=full\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
+            "[Unit]\nDescription=Postwright mail server\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={} -c {} serve\nRestart=always\nRestartSec=5\nLimitNOFILE=65536\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\nProtectSystem=full\nReadWritePaths=-{} -{}\nPrivateTmp=true\n\n[Install]\nWantedBy=multi-user.target\n",
             exe.display(),
-            cfg.display()
+            cfg.display(),
+            cfg_dir.display(),
+            data.display()
         );
         std::fs::write(UNIT, unit).with_context(|| format!("writing {UNIT}"))?;
         systemctl(&["daemon-reload"])?;

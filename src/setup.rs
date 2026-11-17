@@ -7,6 +7,7 @@
 //! someone who has the code. When the wizard finishes, Postwright starts normally.
 
 use crate::config::Config;
+use crate::configloc::Loc;
 use crate::http::{builder, json, json_err, text, Req, Resp};
 use crate::server::{self, Shared};
 use crate::store::{self, User};
@@ -16,7 +17,7 @@ use http_body_util::Full;
 use hyper::StatusCode;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
 
@@ -24,11 +25,11 @@ const SETUP_HTML: &str = include_str!("web/setup.html");
 const SETUP_JS: &str = include_str!("web/setup.js");
 
 /// Does this installation still need the wizard?
-pub fn needed(config: &Path) -> Result<bool> {
+pub fn needed(config: &Loc) -> Result<bool> {
     if !config.exists() {
         return Ok(true);
     }
-    let cfg = Config::load(config)?;
+    let cfg = Config::load_loc(config)?;
     if !cfg.db_path().exists() {
         return Ok(true);
     }
@@ -56,17 +57,16 @@ pub fn machine_name() -> String {
 }
 
 /// Write a starting configuration with a self-signed certificate.
-pub fn write_initial_config(path: &Path, hostname: &str) -> Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&dir)?;
+pub fn write_initial_config(loc: &Loc, hostname: &str) -> Result<()> {
+    std::fs::create_dir_all(loc.data_home())?;
     let mut cfg = Config::default();
     cfg.hostname = hostname.to_string();
-    cfg.data_dir = PathBuf::from("data");
-    cfg.tls.cert = PathBuf::from("data/tls/cert.pem");
-    cfg.tls.key = PathBuf::from("data/tls/key.pem");
+    cfg.data_dir = loc.new_data_dir();
+    cfg.tls.cert = cfg.data_dir.join("tls").join("cert.pem");
+    cfg.tls.key = cfg.data_dir.join("tls").join("key.pem");
     let text = format!("# Postwright configuration, written by the setup wizard. Defaults are used for anything not listed.\n{}", toml::to_string_pretty(&cfg)?);
-    std::fs::write(path, text)?;
-    let loaded = Config::load(path)?;
+    loc.write(&text)?;
+    let loaded = Config::load_loc(loc)?;
     self_signed(&loaded, false)?;
     Ok(())
 }
@@ -99,17 +99,13 @@ fn self_signed(cfg: &Config, replace: bool) -> Result<bool> {
 }
 
 /// Change top-level or nested keys in the config file, keeping the rest.
-fn edit_config(path: &Path, f: impl FnOnce(&mut toml::Table)) -> Result<()> {
-    let old = std::fs::read_to_string(path)?;
+fn edit_config(loc: &Loc, f: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let old = loc.read()?;
     let mut t: toml::Table = old.parse().context("parsing config")?;
     f(&mut t);
     let new = format!("# Postwright configuration. Defaults are used for anything not listed.\n{}", toml::to_string_pretty(&t)?);
-    std::fs::write(path, &new)?;
-    if let Err(e) = Config::load(path) {
-        std::fs::write(path, old)?;
-        return Err(e.context("the new setting wasn't valid, so nothing was changed"));
-    }
-    Ok(())
+    Config::from_toml(&new, &loc.base_dir()).context("the new setting wasn't valid, so nothing was changed")?;
+    loc.write(&new)
 }
 
 fn table<'a>(t: &'a mut toml::Table, key: &str) -> &'a mut toml::Table {
@@ -120,7 +116,7 @@ fn table<'a>(t: &'a mut toml::Table, key: &str) -> &'a mut toml::Table {
 }
 
 struct State {
-    path: PathBuf,
+    path: Loc,
     srv: RwLock<Shared>,
     code: String,
     done: Notify,
@@ -167,16 +163,16 @@ fn open_browser(url: &str) {
 
 /// Run the wizard until it's finished. Returns true when Postwright should start
 /// normally, false when it was asked to stop (Windows service stop, Ctrl+C).
-pub async fn run(path: &Path) -> Result<bool> {
+pub async fn run(path: &Loc) -> Result<bool> {
     if !path.exists() {
         write_initial_config(path, &machine_name())?;
-        tracing::info!("wrote a starting configuration to {}", path.display());
+        tracing::info!("wrote a starting configuration to {}", path.describe());
     }
-    let cfg = Config::load(path)?;
+    let cfg = Config::load_loc(path)?;
     self_signed(&cfg, false)?;
     let srv = server::Server::new(cfg).context("starting the setup wizard")?;
     let st = Arc::new(State {
-        path: path.to_path_buf(),
+        path: path.clone(),
         tls: srv.tls(),
         srv: RwLock::new(srv.clone()),
         code: new_code(),
@@ -234,7 +230,7 @@ pub async fn run(path: &Path) -> Result<bool> {
     // Also into the log and a file next to the settings, because a Windows service
     // has no console to print to.
     crate::logbuf::write_line(&format!("SETUP: open {first} (setup code {})", st.code));
-    let code_file = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join("setup-code.txt");
+    let code_file = path.data_home().join("setup-code.txt");
     let _ = std::fs::write(&code_file, format!("Postwright setup\r\n\r\nOpen: {first}\r\n{}\r\nSetup code: {}\r\n", ips.iter().map(|ip| format!("  or: https://{ip}{suffix}/setup#{}\r\n", st.code)).collect::<String>(), st.code));
     println!("{banner}");
     tracing::info!("setup wizard waiting on port {port}");
@@ -364,7 +360,7 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
             edit_config(&st.path, |t| {
                 t.insert("hostname".into(), toml::Value::String(h2));
             })?;
-            let cfg = Config::load(&st.path)?;
+            let cfg = Config::load_loc(&st.path)?;
             let regenerated = self_signed(&cfg, true)?;
             let new = server::Server::new(cfg)?;
             *st.srv.write().unwrap() = new;
@@ -445,7 +441,7 @@ async fn api(st: &Arc<State>, srv: &Shared, r: &Req, rest: &str) -> Result<Value
 
 /// Re-read the configuration (and certificate) after a change.
 fn reload(st: &Arc<State>) -> Result<()> {
-    let cfg = Config::load(&st.path)?;
+    let cfg = Config::load_loc(&st.path)?;
     *st.srv.write().unwrap() = server::Server::new(cfg)?;
     Ok(())
 }
@@ -467,7 +463,7 @@ async fn state(st: &Arc<State>, srv: &Shared) -> Result<Value> {
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "hostname": srv.cfg.hostname,
-        "config_path": st.path.canonicalize().unwrap_or(st.path.clone()).display().to_string(),
+        "config_path": st.path.describe(),
         "data_dir": srv.cfg.data_dir.display().to_string(),
         "platform": std::env::consts::OS,
         "is_root": is_root(),

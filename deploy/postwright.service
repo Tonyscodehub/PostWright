@@ -31,8 +31,10 @@ RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-ReadWritePaths=/var/lib/postwright
-ReadOnlyPaths=/etc/postwright /etc/letsencrypt
+# /etc/postwright is writable because the admin pages and setup wizard save settings.
+# Make the settings readable by the service: chgrp postwright /etc/postwright/postwright.toml
+ReadWritePaths=/var/lib/postwright /etc/postwright
+ReadOnlyPaths=/etc/letsencrypt
 
 [Install]
 WantedBy=multi-user.target

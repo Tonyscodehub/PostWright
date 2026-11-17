@@ -215,10 +215,18 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let mut cfg: Config = toml::from_str(&text).context("parsing config")?;
-        // Relative paths are relative to the config file, not the current directory,
-        // so the CLI and a service manager always see the same data.
-        let base = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self::from_toml(&text, path.parent().unwrap_or(Path::new("")))
+    }
+
+    /// Load from wherever the settings live (file or registry).
+    pub fn load_loc(loc: &crate::configloc::Loc) -> Result<Self> {
+        Self::from_toml(&loc.read()?, &loc.base_dir())
+    }
+
+    /// Relative paths are relative to `base` (the config file's folder), not the
+    /// current directory, so the CLI and a service manager always see the same data.
+    pub fn from_toml(text: &str, base: &Path) -> Result<Self> {
+        let mut cfg: Config = toml::from_str(text).context("parsing config")?;
         for p in [&mut cfg.data_dir, &mut cfg.tls.cert, &mut cfg.tls.key] {
             if p.is_relative() {
                 *p = base.join(&*p);

@@ -5,6 +5,7 @@ mod caldav;
 mod carddav;
 mod certs;
 mod config;
+mod configloc;
 mod delivery;
 mod filter;
 mod http;
@@ -27,6 +28,7 @@ mod xml;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
+use configloc::Loc;
 use std::path::{Path, PathBuf};
 use store::Store;
 
@@ -38,32 +40,46 @@ use store::Store;
     after_help = "Run with no command to start the server. The first time, it opens a setup page in your browser."
 )]
 struct Cli {
-    /// Path to the configuration file (default: postwright.toml here, or next to the program on Windows).
+    /// Use this settings file. Without it, settings are in the registry on Windows
+    /// (HKLM\SOFTWARE\Postwright) and in /etc/postwright/postwright.toml on Linux.
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
 
-fn config_path(given: Option<PathBuf>) -> PathBuf {
+fn config_loc(given: Option<PathBuf>, is_service: bool) -> Loc {
     if let Some(p) = given {
-        return p;
+        return Loc::File(p);
     }
-    let here = PathBuf::from("postwright.toml");
-    if here.exists() || !cfg!(windows) {
-        return here;
+    #[cfg(unix)]
+    {
+        let _ = is_service;
+        // An installation made by an earlier version keeps its settings where they are.
+        let here = PathBuf::from("postwright.toml");
+        let std = Loc::standard();
+        if !std.exists() && here.exists() {
+            return Loc::File(here);
+        }
+        std
     }
-    // Double-clicked on Windows: keep everything next to the program.
-    let mine = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("postwright.toml"))).unwrap_or(here);
-    if !mine.exists() {
-        if let Some(prev) = upgrade::find_previous(&mine) {
-            match upgrade::adopt(&prev, &mine) {
-                Ok(()) => println!("\nFound the settings of a previous version at {}.\nThis version uses them, and the same mail and data: nothing has been moved.\n", prev.display()),
-                Err(e) => eprintln!("Found earlier settings at {} but couldn't use them: {e:#}", prev.display()),
+    #[cfg(windows)]
+    {
+        let loc = Loc::Registry;
+        if !loc.exists() && !is_service {
+            let mine = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("postwright.toml"))).unwrap_or_else(|| PathBuf::from("postwright.toml"));
+            if let Some(prev) = upgrade::find_previous(&mine) {
+                if let Err(e) = upgrade::import_legacy(&prev) {
+                    eprintln!(
+                        "\nFound the settings of an earlier version at {} but couldn't move them into the registry: {e:#}\nUsing that file as it is for now.\n",
+                        prev.display()
+                    );
+                    return Loc::File(prev);
+                }
             }
         }
+        loc
     }
-    mine
 }
 
 #[derive(Subcommand)]
@@ -73,8 +89,10 @@ enum Cmd {
         /// Public host name of this server, e.g. mail.example.com
         #[arg(long)]
         hostname: String,
-        #[arg(long, default_value = "./data")]
-        data_dir: PathBuf,
+        /// Where mail is kept (default: C:\ProgramData\Postwright\data on Windows,
+        /// /var/lib/postwright on Linux, or "data" next to a -c settings file).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Run the mail server.
     Serve,
@@ -119,6 +137,11 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
+    },
+    /// See, back up or restore the settings (kept in the registry on Windows).
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
     },
     /// Let one user open another's mailbox and/or send from their address.
     Delegate {
@@ -282,6 +305,18 @@ enum CalendarCmd {
 }
 
 #[derive(Subcommand)]
+enum ConfigCmd {
+    /// Say where the settings are kept.
+    Where,
+    /// Print the settings.
+    Show,
+    /// Save the settings to a file.
+    Export { file: PathBuf },
+    /// Replace the settings with those in a file (checked first).
+    Import { file: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum ServiceCmd {
     /// Install (or update) the service and set it to start at boot.
     Install {
@@ -366,11 +401,34 @@ fn interactive_start() -> bool {
     std::env::args().len() == 1
 }
 
-fn service_cmd(path: &Path, cmd: &ServiceCmd) -> Result<()> {
+fn config_cmd(loc: &Loc, cmd: ConfigCmd) -> Result<()> {
+    match cmd {
+        ConfigCmd::Where => {
+            println!("Settings: {}", loc.describe());
+            if let Ok(cfg) = Config::load_loc(loc) {
+                println!("Data:     {}", cfg.data_dir.display());
+            }
+        }
+        ConfigCmd::Show => print!("{}", loc.read()?),
+        ConfigCmd::Export { file } => {
+            std::fs::write(&file, format!("# Postwright settings exported from {}\n{}", loc.describe(), loc.read()?))?;
+            println!("Saved to {}", file.display());
+        }
+        ConfigCmd::Import { file } => {
+            let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+            Config::from_toml(&text, &loc.base_dir()).context("those settings aren't valid, so nothing was changed")?;
+            loc.write(&text)?;
+            println!("Settings in {} replaced. Restart Postwright (or the service) to use them.", loc.describe());
+        }
+    }
+    Ok(())
+}
+
+fn service_cmd(path: &Loc, cmd: &ServiceCmd) -> Result<()> {
     match cmd {
         ServiceCmd::Install { start } => {
             if !path.exists() {
-                bail!("{} doesn't exist yet: run postwright on its own first to go through setup", path.display());
+                bail!("there are no settings yet ({}): run postwright on its own first to go through setup", path.describe());
             }
             println!("{}", service::install(path)?);
             if *start {
@@ -390,7 +448,10 @@ fn service_cmd(path: &Path, cmd: &ServiceCmd) -> Result<()> {
         ServiceCmd::Status => println!("{}", service::state().describe()),
         ServiceCmd::Run => {
             #[cfg(windows)]
-            return service::dispatch(std::path::absolute(path)?);
+            return service::dispatch(match path {
+                Loc::File(p) => Loc::File(std::path::absolute(p)?),
+                Loc::Registry => Loc::Registry,
+            });
             #[cfg(not(windows))]
             bail!("\"service run\" is only used on Windows; on Linux systemd runs \"postwright serve\"");
         }
@@ -400,10 +461,11 @@ fn service_cmd(path: &Path, cmd: &ServiceCmd) -> Result<()> {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let path = config_path(cli.config);
+    let is_service = matches!(cli.cmd, Some(Cmd::Service { cmd: ServiceCmd::Run }));
+    let path = config_loc(cli.config, is_service);
     let cmd = cli.cmd.unwrap_or(Cmd::Serve);
     if let Cmd::Init { hostname, data_dir } = &cmd {
-        return init(&path, hostname, data_dir);
+        return init(&path, hostname, data_dir.as_deref());
     }
     if let Cmd::Serve = cmd {
         // Double-clicked while the service is already running: don't fight it for the ports.
@@ -426,15 +488,18 @@ fn real_main() -> Result<()> {
     if let Cmd::Service { cmd } = &cmd {
         return service_cmd(&path, cmd);
     }
-    let cfg = Config::load(&path).map_err(|e| {
+    if let Cmd::Config { cmd } = cmd {
+        return config_cmd(&path, cmd);
+    }
+    let cfg = Config::load_loc(&path).map_err(|e| {
         if !path.exists() {
-            anyhow!("{} doesn't exist yet: run \"postwright\" on its own to start the setup wizard", path.display())
+            anyhow!("there are no settings yet ({}): run \"postwright\" on its own to start the setup wizard", path.describe())
         } else {
             e
         }
     })?;
     match cmd {
-        Cmd::Serve | Cmd::Service { .. } => unreachable!(),
+        Cmd::Serve | Cmd::Service { .. } | Cmd::Config { .. } => unreachable!(),
         Cmd::Domain { cmd } => domain_cmd(&cfg, cmd),
         Cmd::User { cmd } => user_cmd(&cfg, cmd),
         Cmd::Alias { cmd } => alias_cmd(&cfg, cmd),
@@ -458,20 +523,23 @@ fn open_store(cfg: &Config) -> Result<Store> {
     Store::open(&cfg.db_path(), &cfg.blob_dir(), 1)
 }
 
-fn init(path: &Path, hostname: &str, data_dir: &Path) -> Result<()> {
+fn init(path: &Loc, hostname: &str, data_dir: Option<&Path>) -> Result<()> {
     if path.exists() {
-        bail!("{} already exists", path.display());
+        bail!("settings already exist in {}", path.describe());
     }
+    let data_dir = &data_dir.map(Path::to_path_buf).unwrap_or_else(|| path.new_data_dir());
+    // Relative to the settings, like everything else.
+    let abs = if data_dir.is_relative() { path.base_dir().join(data_dir) } else { data_dir.clone() };
     let mut cfg = Config::default();
     cfg.hostname = hostname.to_ascii_lowercase();
     cfg.data_dir = data_dir.to_path_buf();
     cfg.tls.cert = data_dir.join("tls").join("cert.pem");
     cfg.tls.key = data_dir.join("tls").join("key.pem");
-    std::fs::create_dir_all(data_dir.join("tls"))?;
-    if !cfg.tls.cert.exists() {
+    std::fs::create_dir_all(abs.join("tls"))?;
+    if !abs.join("tls").join("cert.pem").exists() {
         let ck = rcgen::generate_simple_self_signed(vec![cfg.hostname.clone()])?;
-        std::fs::write(&cfg.tls.cert, ck.cert.pem())?;
-        write_private(&cfg.tls.key, ck.key_pair.serialize_pem().as_bytes())?;
+        std::fs::write(abs.join("tls").join("cert.pem"), ck.cert.pem())?;
+        write_private(&abs.join("tls").join("key.pem"), ck.key_pair.serialize_pem().as_bytes())?;
         println!("Generated a self-signed certificate for {hostname}.");
         println!("Replace it with a real one (e.g. Let's Encrypt) before going live: see README.");
     }
@@ -479,9 +547,9 @@ fn init(path: &Path, hostname: &str, data_dir: &Path) -> Result<()> {
         "# Postwright configuration. All keys are optional; defaults shown.\n{}",
         toml::to_string_pretty(&cfg)?
     );
-    std::fs::write(path, text)?;
-    open_store(&cfg)?;
-    println!("Wrote {}. Next: postwright domain add <domain>", path.display());
+    path.write(&text)?;
+    open_store(&Config::load_loc(path)?)?;
+    println!("Wrote the settings to {}. Next: postwright domain add <domain>", path.describe());
     Ok(())
 }
 
@@ -918,7 +986,7 @@ fn queue_cmd(cfg: &Config, cmd: QueueCmd) -> Result<()> {
     Ok(())
 }
 
-pub fn serve(path: &Path) -> Result<()> {
+pub fn serve(path: &Loc) -> Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(|| logbuf::Tee)
@@ -933,7 +1001,7 @@ pub fn serve(path: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    let cfg = Config::load(path)?;
+    let cfg = Config::load_loc(path)?;
     rt.block_on(async move {
         let srv = server::Server::new(cfg).context("starting server")?;
         let l = srv.cfg.listeners.clone();
