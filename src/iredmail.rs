@@ -171,16 +171,23 @@ fn detect_backend(postfix_dir: &Path) -> Result<Backend> {
     let main = postfix_dir.join("main.cf");
     let text = std::fs::read_to_string(&main)
         .with_context(|| format!("reading {} (run this on the iRedMail server, or pass --backend)", main.display()))?;
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("virtual_mailbox_domains"))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if line.contains("mysql:") {
+    // Look at every lookup table Postfix uses (values can span continuation lines and
+    // the domain list can be a $variable), then fall back to iRedMail's own folders.
+    let text = text.to_ascii_lowercase();
+    let count = |k: &str| text.matches(k).count();
+    let (m, p, l) = (count("mysql:"), count("pgsql:"), count("ldap:"));
+    let has = |d: &str| postfix_dir.join(d).is_dir();
+    if m > 0 && m >= p && m >= l {
         Ok(Backend::Mysql)
-    } else if line.contains("pgsql:") {
+    } else if p > 0 && p >= l {
         Ok(Backend::Pgsql)
-    } else if line.contains("ldap:") {
+    } else if l > 0 {
+        Ok(Backend::Ldap)
+    } else if has("mysql") {
+        Ok(Backend::Mysql)
+    } else if has("pgsql") {
+        Ok(Backend::Pgsql)
+    } else if has("ldap") {
         Ok(Backend::Ldap)
     } else {
         bail!("could not detect the iRedMail backend from {}; pass --backend mysql|pgsql|ldap", main.display())
