@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "postwright"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -4390,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "postwright-admin"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "dirs",
