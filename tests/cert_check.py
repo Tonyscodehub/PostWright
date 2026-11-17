@@ -79,6 +79,18 @@ r = sftp("put upload/fullchain.pem fullchain.pem\nput upload/key.pem key.pem\n")
 time.sleep(1.5)
 check("mismatched key refused", served_fp() == der_fp(f"{W}/good.crt") and "does not match the certificate" in open("/tmp/pwtest/server.log").read())
 
+# OPNsense uploads each file in a session of its own: the pieces are put together
+make_cert("good2", "mail.test.local", f"{W}/ca.key", f"{W}/ca.crt")
+open(f"{W}/upload/cert.pem", "wb").write(open(f"{W}/good2.crt", "rb").read())
+open(f"{W}/upload/fullchain.pem", "wb").write(open(f"{W}/good2.crt", "rb").read() + open(f"{W}/ca.crt", "rb").read())
+open(f"{W}/upload/key.pem", "wb").write(open(f"{W}/good2.key", "rb").read())
+for f in ["ca.pem", "cert.pem", "fullchain.pem", "key.pem"]:
+    sftp(f"put upload/{f} {f}\n")
+time.sleep(1.5)
+check("files pushed in separate sessions are installed together", served_fp() == der_fp(f"{W}/good2.crt"))
+r = sh("ssh-keyscan -T 5 -p 2222 127.0.0.1")
+check("ssh-keyscan reads the receiver's host key (OPNsense 'Test connect')", "ssh-ed25519" in r.stdout, r.stdout + r.stderr)
+
 # Security: no reading back, no shell/exec, unknown key and wrong user rejected
 r = sftp("get key.pem /tmp/stolen.pem\n")
 check("files can't be downloaded", r.returncode != 0 and not os.path.exists("/tmp/stolen.pem"))

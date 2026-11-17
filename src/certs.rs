@@ -529,9 +529,36 @@ fn normalise(path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// Files pushed recently, by sender. OPNsense's ACME client uploads each file in a
+/// session of its own (CA, certificate, full chain, then key), so the pieces are
+/// gathered across sessions from the same address for a few minutes.
+static PENDING: std::sync::Mutex<Option<HashMap<std::net::IpAddr, (std::time::Instant, BTreeMap<String, Vec<u8>>)>>> = std::sync::Mutex::new(None);
+const PENDING_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Add this session's files to what the sender pushed recently and return the lot.
+fn gather(ip: std::net::IpAddr, files: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+    let mut g = PENDING.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    m.retain(|_, (t, _)| t.elapsed() < PENDING_FOR);
+    let e = m.entry(ip).or_insert_with(|| (std::time::Instant::now(), BTreeMap::new()));
+    e.0 = std::time::Instant::now();
+    for (k, v) in files {
+        e.1.insert(k.clone(), v.clone());
+    }
+    e.1.clone()
+}
+
+fn forget(ip: std::net::IpAddr) {
+    if let Some(m) = PENDING.lock().unwrap().as_mut() {
+        m.remove(&ip);
+    }
+}
+
 impl Sftp {
     fn try_install(&mut self) {
-        let f = &self.files;
+        let ip = self.peer.ip();
+        let all = gather(ip, &self.files);
+        let f = &all;
         let chain = match (f.get("fullchain.pem"), f.get("cert.pem"), f.get("ca.pem").or(f.get("chain.pem"))) {
             (Some(fc), _, _) => fc.clone(),
             (None, Some(c), Some(ca)) => {
@@ -549,12 +576,14 @@ impl Sftp {
             // OPNsense sends the key last, so this usually waits for it. A renewal that
             // reuses the existing key installs straight away against the current key.
             if let Ok(k) = std::fs::read(&self.srv.cfg.tls.key) {
-                let _ = install(&self.srv, &chain, &k, &format!("SFTP upload from {}", self.peer.ip()));
+                if install(&self.srv, &chain, &k, &format!("SFTP upload from {ip}")).is_ok() {
+                    forget(ip);
+                }
             }
             return;
         };
-        match install(&self.srv, &chain, &key, &format!("SFTP upload from {}", self.peer.ip())) {
-            Ok(_) => {}
+        match install(&self.srv, &chain, &key, &format!("SFTP upload from {ip}")) {
+            Ok(_) => forget(ip),
             Err(e) => tracing::warn!("certificate receiver: upload from {} not installed: {e:#}", self.peer.ip()),
         }
     }
